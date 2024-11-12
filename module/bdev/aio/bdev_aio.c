@@ -27,6 +27,10 @@
 #include <libaio.h>
 #endif
 
+#ifdef RWF_NOWAIT
+#undef RWF_NOWAIT
+#endif
+
 #define AIO_FDISK_LOG_FMT "%s,fdisk:%p,filename:%s"
 #define AIO_FDISK_LOG_ARGS(fdisk) \
   (fdisk)->disk.name, \
