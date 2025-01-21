@@ -4687,6 +4687,7 @@ blob_thin_prov_rw(void)
 	uint8_t payload_read[10 * BLOCKLEN];
 	uint8_t payload_write[10 * BLOCKLEN];
 	uint64_t write_bytes;
+	uint64_t write_zeroes_bytes;
 	uint64_t read_bytes;
 	uint64_t expected_bytes;
 
@@ -4733,6 +4734,7 @@ blob_thin_prov_rw(void)
 	CU_ASSERT(memcmp(zero, payload_read, 10 * BLOCKLEN) == 0);
 
 	write_bytes = g_dev_write_bytes;
+	write_zeroes_bytes = g_dev_write_zeroes_bytes;
 	read_bytes = g_dev_read_bytes;
 
 	/* Perform write on thread 1. That will allocate cluster on thread 0 via send_msg */
@@ -4759,7 +4761,8 @@ blob_thin_prov_rw(void)
 		/* Add one more page for EXTENT_PAGE write */
 		expected_bytes += spdk_bs_get_page_size(bs);
 	}
-	CU_ASSERT(g_dev_write_bytes - write_bytes == expected_bytes);
+	CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+		  expected_bytes);
 	CU_ASSERT(g_dev_read_bytes - read_bytes == 0);
 
 	spdk_blob_io_read(blob, channel, payload_read, 4, 10, blob_op_complete, NULL);
@@ -4792,6 +4795,7 @@ blob_thin_prov_write_count_io(void)
 	uint64_t io_unit_size;
 	uint8_t payload_write[BLOCKLEN];
 	uint64_t write_bytes;
+	uint64_t write_zeroes_bytes;
 	uint64_t read_bytes;
 	uint64_t expected_bytes;
 	const uint32_t CLUSTER_SZ = g_phys_blocklen * 4;
@@ -4846,6 +4850,7 @@ blob_thin_prov_write_count_io(void)
 	memset(payload_write, 0, sizeof(payload_write));
 	for (i = 0; i < 8; i++) {
 		write_bytes = g_dev_write_bytes;
+		write_zeroes_bytes = g_dev_write_zeroes_bytes;
 		read_bytes = g_dev_read_bytes;
 
 		g_bserrno = -1;
@@ -4868,12 +4873,14 @@ blob_thin_prov_write_count_io(void)
 			 */
 			expected_bytes = io_unit_size + 2 * spdk_bs_get_page_size(bs);
 		}
-		CU_ASSERT((g_dev_write_bytes - write_bytes) == expected_bytes);
+		CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+			  expected_bytes);
 
 		/* The write should have synced the metadata already.  Do another sync here
 		 * just to confirm.
 		 */
 		write_bytes = g_dev_write_bytes;
+		write_zeroes_bytes = g_dev_write_zeroes_bytes;
 		read_bytes = g_dev_read_bytes;
 
 		g_bserrno = -1;
@@ -4901,7 +4908,8 @@ blob_thin_prov_write_count_io(void)
 		 * For extent table metadata, we should have written the I/O and the extent metadata page.
 		 */
 		expected_bytes = io_unit_size + spdk_bs_get_page_size(bs);
-		CU_ASSERT((g_dev_write_bytes - write_bytes) == expected_bytes);
+		CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+			  expected_bytes);
 
 		/* Send unmap aligned to the whole cluster - should free it up */
 		g_bserrno = -1;
@@ -5208,6 +5216,7 @@ blob_thin_prov_rle(void)
 	uint8_t payload_read[10 * BLOCKLEN];
 	uint8_t payload_write[10 * BLOCKLEN];
 	uint64_t write_bytes;
+	uint64_t write_zeroes_bytes;
 	uint64_t read_bytes;
 	uint64_t expected_bytes;
 	uint64_t io_unit;
@@ -5240,6 +5249,7 @@ blob_thin_prov_rle(void)
 	CU_ASSERT(memcmp(zero, payload_read, 10 * BLOCKLEN) == 0);
 
 	write_bytes = g_dev_write_bytes;
+	write_zeroes_bytes = g_dev_write_zeroes_bytes;
 	read_bytes = g_dev_read_bytes;
 
 	/* Issue write to second cluster in a blob */
@@ -5255,7 +5265,8 @@ blob_thin_prov_rle(void)
 		/* Add one more page for EXTENT_PAGE write */
 		expected_bytes += spdk_bs_get_page_size(bs);
 	}
-	CU_ASSERT(g_dev_write_bytes - write_bytes == expected_bytes);
+	CU_ASSERT(((g_dev_write_bytes - write_bytes) - (g_dev_write_zeroes_bytes - write_zeroes_bytes)) ==
+		  expected_bytes);
 	CU_ASSERT(g_dev_read_bytes - read_bytes == 0);
 
 	spdk_blob_io_read(blob, channel, payload_read, io_unit, 10, blob_op_complete, NULL);
