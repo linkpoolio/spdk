@@ -1773,8 +1773,8 @@ rpc_bdev_lvol_start_range_shallow_copy(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Range shallow copying lvol\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_shallow_copy_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_shallow_copy_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_start_shallow_copy_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_start_shallow_copy_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
