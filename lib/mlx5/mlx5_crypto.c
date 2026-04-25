@@ -256,8 +256,21 @@ spdk_mlx5_device_query_caps(struct ibv_context *context, struct spdk_mlx5_device
 		return rc;
 	}
 
-	caps->crc32c_supported = DEVX_GET(query_hca_cap_out, out, capability.cmd_hca_cap.sho) &&
-				 DEVX_GET(query_hca_cap_out, out, capability.cmd_hca_cap.sig_crc32c);
+	/*
+	 * linkpool fork: force crc32c_supported = false even if the NIC HCA caps
+	 * advertise sho + sig_crc32c. ConnectX-6 Dx fw 22.43.2566 reports the
+	 * caps but the firmware can't actually back a signature mkey pool of
+	 * the size accel_mlx5 wants (>= cores * 16) — accel_mlx5_dev_ctx_init
+	 * fails with ENOMEM at mlx5_mkey_pools_init for the SIGNATURE pool,
+	 * which fails framework_start_init and crashloops the IM. We don't use
+	 * T10-DIF/PRACT and CRC32C falls back to sw_accel (CPU, runs at multi
+	 * GB/s via SSE4.2/ISA-L) — meaningful only for blobstore metadata
+	 * checksums which are infrequent and tiny. Keeps the UMR-per-IO
+	 * hot-path (plain mkeys, allocated separately at line 2961) which is
+	 * what we actually want from accel_mlx5 for RDMA Write data buffer
+	 * registration.
+	 */
+	caps->crc32c_supported = false;
 
 	caps->crypto_supported = DEVX_GET(query_hca_cap_out, out, capability.cmd_hca_cap.crypto);
 	if (!caps->crypto_supported) {
