@@ -696,6 +696,7 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 
 				case SPDK_BDEV_IO_TYPE_FLUSH:
 				case SPDK_BDEV_IO_TYPE_UNMAP:
+				case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 					raid_io->raid_bdev->module->submit_null_payload_request(raid_io);
 					break;
 				default:
@@ -1043,6 +1044,7 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 		raid_bdev_submit_null_payload_request(raid_io);
 		break;
 
@@ -1072,7 +1074,8 @@ _raid_bdev_io_type_supported(struct raid_bdev *raid_bdev, enum spdk_bdev_io_type
 	struct raid_base_bdev_info *base_info;
 
 	if (io_type == SPDK_BDEV_IO_TYPE_FLUSH ||
-	    io_type == SPDK_BDEV_IO_TYPE_UNMAP) {
+	    io_type == SPDK_BDEV_IO_TYPE_UNMAP ||
+	    io_type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
 		if (raid_bdev->module->submit_null_payload_request == NULL) {
 			return false;
 		}
@@ -1114,6 +1117,7 @@ raid_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 		return _raid_bdev_io_type_supported(ctx, io_type);
 
 	default:

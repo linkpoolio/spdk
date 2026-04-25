@@ -449,6 +449,12 @@ raid1_submit_null_payload_request(struct raid_bdev_io *raid_io)
 						     raid1_null_payload_request_io_completion, raid_io);
 			break;
 
+		case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+			ret = raid_bdev_write_zeroes_blocks(base_info, base_ch,
+							    raid_io->offset_blocks, raid_io->num_blocks,
+							    raid1_null_payload_request_io_completion, raid_io);
+			break;
+
 		default:
 			SPDK_ERRLOG("submit request, invalid io type with null payload %u\n", raid_io->type);
 			assert(false);
