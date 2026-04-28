@@ -223,8 +223,6 @@ struct spdk_blob_store {
 	void				*esnap_unload_cb_arg;
 };
 
-struct spdk_blob_copy_cluster_ctx;
-
 struct spdk_bs_channel {
 	struct spdk_bs_request_set	*req_mem;
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
@@ -234,21 +232,10 @@ struct spdk_bs_channel {
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
 
-	/* In-flight cluster allocations on this channel. Each entry is a
-	 * spdk_blob_copy_cluster_ctx with its own per-ctx new_cluster_page,
-	 * so concurrent allocations on different (blob, cluster_number) pairs
-	 * proceed in parallel. New ops for an already-in-flight
-	 * (blob, cluster_number) attach to that entry's waiters list instead
-	 * of starting a duplicate allocation.
-	 *
-	 * CoW DMA buffer concurrency is gated by spdk_malloc success/failure,
-	 * not a fixed cap — overflow_ops queues ops whose cluster_sz buffer
-	 * allocation failed; the queue drains on the next CoW completion when
-	 * a buffer is freed. Self-tunes to actual hugepage availability.
-	 */
-	TAILQ_HEAD(spdk_bs_inflight_cluster_allocs,
-		   spdk_blob_copy_cluster_ctx) inflight_cluster_allocs;
-	TAILQ_HEAD(, spdk_bs_request_set) overflow_ops;
+	/* This page is only used during insert of a new cluster. */
+	struct spdk_blob_md_page	*new_cluster_page;
+
+	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 
 	/* This page is only used during release of an existing cluster. */
