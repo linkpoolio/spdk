@@ -1286,9 +1286,48 @@ test_multi_raid(void)
 static void
 test_io_type_supported(void)
 {
+	struct rpc_bdev_raid_create req;
+	struct rpc_bdev_raid_delete destroy_req;
+	struct raid_bdev *pbdev;
+
+	/* Cases that don't depend on a real raid_bdev (case-statement coverage). */
 	CU_ASSERT(raid_bdev_io_type_supported(NULL, SPDK_BDEV_IO_TYPE_READ) == true);
 	CU_ASSERT(raid_bdev_io_type_supported(NULL, SPDK_BDEV_IO_TYPE_WRITE) == true);
 	CU_ASSERT(raid_bdev_io_type_supported(NULL, SPDK_BDEV_IO_TYPE_INVALID) == false);
+
+	/* Cases that fan out to base bdevs need a real pbdev. Reuse the raid1
+	 * scaffold: with the base-bdev type_supported stub returning true and
+	 * raid1 module providing submit_null_payload_request, all three null-
+	 * payload I/O types must be advertised. */
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	verify_raid_bdev_present("raid1", false);
+	create_raid_bdev_create_req(&req, "raid1", 0, true, 0, false);
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev(&req, true, RAID_BDEV_STATE_ONLINE);
+	TAILQ_FOREACH(pbdev, &g_raid_bdev_list, global_link) {
+		if (strcmp(pbdev->bdev.name, "raid1") == 0) {
+			break;
+		}
+	}
+	CU_ASSERT(pbdev != NULL);
+
+	CU_ASSERT(raid_bdev_io_type_supported(pbdev, SPDK_BDEV_IO_TYPE_FLUSH) == true);
+	CU_ASSERT(raid_bdev_io_type_supported(pbdev, SPDK_BDEV_IO_TYPE_UNMAP) == true);
+	CU_ASSERT(raid_bdev_io_type_supported(pbdev, SPDK_BDEV_IO_TYPE_WRITE_ZEROES) == true);
+	CU_ASSERT(raid_bdev_io_type_supported(pbdev, SPDK_BDEV_IO_TYPE_RESET) == true);
+
+	free_test_req(&req);
+	create_raid_bdev_delete_req(&destroy_req, "raid1", 0);
+	rpc_bdev_raid_delete(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev_present("raid1", false);
+
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
 }
 
 static void
@@ -1766,6 +1805,31 @@ test_raid_io_split(void)
 	raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
 	_bdev_io_initialize(bdev_io, ch, &pbdev->bdev, 0, g_strip_size, SPDK_BDEV_IO_TYPE_UNMAP, 0,
 			    0);
+
+	split_offset = 1;
+	raid_ch->process.offset = split_offset;
+	raid_bdev_submit_request(ch, bdev_io);
+	CU_ASSERT(raid_io->num_blocks == g_strip_size - split_offset);
+	CU_ASSERT(raid_io->offset_blocks == split_offset);
+
+	complete_deferred_ios();
+	CU_ASSERT(raid_io->num_blocks == split_offset);
+	CU_ASSERT(raid_io->offset_blocks == 0);
+
+	complete_deferred_ios();
+	CU_ASSERT(raid_io->num_blocks == g_strip_size);
+	CU_ASSERT(raid_io->offset_blocks == 0);
+
+	CU_ASSERT(g_io_comp_status == g_child_io_status_flag);
+
+	bdev_io_cleanup(bdev_io);
+
+	/* test split of write_zeroes io (same null-payload split path as unmap) */
+	bdev_io = calloc(1, sizeof(struct spdk_bdev_io) + sizeof(struct raid_bdev_io));
+	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
+	raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
+	_bdev_io_initialize(bdev_io, ch, &pbdev->bdev, 0, g_strip_size, SPDK_BDEV_IO_TYPE_WRITE_ZEROES,
+			    0, 0);
 
 	split_offset = 1;
 	raid_ch->process.offset = split_offset;

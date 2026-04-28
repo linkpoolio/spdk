@@ -557,6 +557,24 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 				      num_blocks, cb, cb_arg);
 }
 
+/**
+ * Raid bdev I/O wrapper for spdk_bdev_write_zeroes_blocks function. WRITE_ZEROES
+ * is dispatched as a null-payload op to base bdevs that support it natively
+ * (NVMe Write Zeroes, AIO fallocate(PUNCH_HOLE), malloc memset). Without this
+ * forwarding the bdev layer falls back to a buffered-zero emulation that ships
+ * a full zero buffer per op — for large clusters this is the dominant cost on
+ * thin-lvol cluster allocation (blob_allocate_and_copy_cluster).
+ */
+static inline int
+raid_bdev_write_zeroes_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
+			      uint64_t offset_blocks, uint64_t num_blocks,
+			      spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	return spdk_bdev_write_zeroes_blocks(base_info->desc, ch,
+					     base_info->data_offset + offset_blocks,
+					     num_blocks, cb, cb_arg);
+}
+
 /*
  * Definitions related to raid bdev superblock
  */
