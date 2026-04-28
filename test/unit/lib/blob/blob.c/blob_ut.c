@@ -8437,6 +8437,64 @@ blob_persist_test(void)
 	poll_threads();
 }
 
+/* Exercises the batched blob_persist_write_extent_pages path:
+ * resizes a thin blob to span multiple EP boundaries and dirties one
+ * cluster per EP, forcing sync_md to write 3 extent pages in a single
+ * bs_batch instead of the old serial tail-recursive RTT-per-page. */
+static void
+blob_persist_multi_extent_pages(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	uint64_t io_units_per_cluster;
+	uint64_t target_clusters;
+	uint8_t buf[DEV_BUFFER_BLOCKLEN];
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 0;
+	blob = ut_blob_create_and_open(bs, &opts);
+	io_units_per_cluster = bs_io_units_per_cluster(blob);
+
+	target_clusters = 2 * SPDK_EXTENTS_PER_EP + 1;
+	if (target_clusters > spdk_bs_free_cluster_count(bs)) {
+		ut_blob_close_and_delete(bs, blob);
+		spdk_bs_free_io_channel(channel);
+		poll_threads();
+		return;
+	}
+	spdk_blob_resize(blob, target_clusters, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_blob_io_write(blob, channel, buf, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_io_write(blob, channel, buf, SPDK_EXTENTS_PER_EP * io_units_per_cluster, 1,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_io_write(blob, channel, buf, 2 * SPDK_EXTENTS_PER_EP * io_units_per_cluster, 1,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 3);
+
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
 static void
 blob_decouple_snapshot(void)
 {
@@ -11364,6 +11422,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_io_unit_compatibility);
 		CU_ADD_TEST(suite_bs, blob_simultaneous_operations);
 		CU_ADD_TEST(suite_bs, blob_persist_test);
+		CU_ADD_TEST(suite_bs, blob_persist_multi_extent_pages);
 		CU_ADD_TEST(suite_bs, blob_decouple_snapshot);
 		CU_ADD_TEST(suite_bs, blob_seek_io_unit);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_create);
