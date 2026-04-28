@@ -4790,6 +4790,127 @@ blob_thin_prov_rw(void)
 	g_blobid = 0;
 }
 
+/*
+ * blob_thin_prov_parallel_alloc_diff_cluster: writes to N different unallocated
+ * clusters submitted back-to-back on the same channel must all start their
+ * cluster allocations in parallel — i.e., before any of them completes. The
+ * pre-patch behaviour serialised every unallocated-cluster write through a
+ * single channel-shared scratch page, so all N would queue behind whichever
+ * allocation was currently in flight. The patched code allows different
+ * (blob, cluster_number) pairs to allocate concurrently.
+ *
+ * Validation: free_cluster_count must drop by N immediately after submitting
+ * N writes, before any poll happens. (Each in-flight allocation claims one
+ * cluster from the bitmap; the count is updated synchronously inside
+ * bs_allocate_cluster.)
+ */
+static void
+blob_thin_prov_parallel_alloc_diff_cluster(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	uint64_t free_clusters_before;
+	uint64_t io_unit_size;
+	uint32_t cluster_io_units;
+	uint8_t payload_write[BLOCKLEN];
+	const uint32_t N = 4;
+	uint32_t i;
+
+	free_clusters_before = spdk_bs_free_cluster_count(bs);
+	io_unit_size = spdk_bs_get_io_unit_size(bs);
+	cluster_io_units = spdk_bs_get_cluster_size(bs) / io_unit_size;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = N + 1;
+	blob = ut_blob_create_and_open(bs, &opts);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+
+	memset(payload_write, 0xE5, sizeof(payload_write));
+
+	/* Submit one write into each of the first N clusters. After all N
+	 * submissions and before any poll, every alloc must already be
+	 * in flight (each consumed a cluster). With the pre-patch
+	 * channel-wide serialiser, only the first would have started and
+	 * the rest would queue, so the count would only drop by 1. */
+	for (i = 0; i < N; i++) {
+		spdk_blob_io_write(blob, channel, payload_write, i * cluster_io_units, 1,
+				   blob_op_complete, NULL);
+	}
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters_before - N);
+
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == N);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters_before - N);
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
+/*
+ * blob_thin_prov_parallel_alloc_same_cluster: two writes targeting the same
+ * cluster on the same channel must share a single allocation. The second one
+ * is queued on the in-flight ctx's waiters list and re-executed on completion;
+ * by that time bs_io_unit_is_allocated() returns true and the second op
+ * bypasses the cluster-allocate path entirely.
+ *
+ * Validation: submit two writes targeting the same cluster (different
+ * sub-offsets), free_cluster_count drops by exactly 1 (not 2) — confirming
+ * coalescing.
+ */
+static void
+blob_thin_prov_parallel_alloc_same_cluster(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	uint64_t free_clusters_before;
+	uint8_t payload_write[BLOCKLEN];
+
+	free_clusters_before = spdk_bs_free_cluster_count(bs);
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 2;
+	blob = ut_blob_create_and_open(bs, &opts);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+
+	memset(payload_write, 0xE5, sizeof(payload_write));
+
+	/* Two writes to different sub-offsets within cluster 0. Both find no
+	 * cluster allocated; the first starts a cluster_alloc and inserts a
+	 * ctx into the channel's inflight list; the second matches that ctx
+	 * by (blob, cluster_number) and queues onto its waiters. Only ONE
+	 * cluster is claimed from the bitmap. */
+	spdk_blob_io_write(blob, channel, payload_write, 0, 1, blob_op_complete, NULL);
+	spdk_blob_io_write(blob, channel, payload_write, 1, 1, blob_op_complete, NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters_before - 1);
+
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters_before - 1);
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
 static void
 blob_thin_prov_write_count_io(void)
 {
@@ -11219,6 +11340,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_thin_prov_alloc);
 		CU_ADD_TEST(suite_bs, blob_insert_cluster_msg_test);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw);
+		CU_ADD_TEST(suite_bs, blob_thin_prov_parallel_alloc_diff_cluster);
+		CU_ADD_TEST(suite_bs, blob_thin_prov_parallel_alloc_same_cluster);
 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rle);

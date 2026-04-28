@@ -2800,6 +2800,17 @@ struct spdk_blob_copy_cluster_ctx {
 	uint32_t new_extent_page;
 	spdk_bs_sequence_t *seq;
 	struct spdk_blob_md_page *new_cluster_page;
+	/* The cluster index this ctx is allocating, used to coalesce
+	 * concurrent writes for the same (blob, cluster_number). */
+	uint32_t cluster_number;
+	/* Channel link for the per-channel inflight allocations list. */
+	TAILQ_ENTRY(spdk_blob_copy_cluster_ctx) ch_link;
+	/* User ops that arrived while this allocation was already in
+	 * flight for the same (blob, cluster_number). They are re-executed
+	 * in completion order; by the time they re-enter
+	 * bs_allocate_and_copy_cluster the cluster is already allocated
+	 * (bs_io_unit_is_allocated returns true) so they bypass this path. */
+	TAILQ_HEAD(, spdk_bs_request_set) waiters;
 };
 
 struct spdk_blob_free_cluster_ctx {
@@ -2816,15 +2827,18 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 	struct spdk_bs_request_set *set = (struct spdk_bs_request_set *)ctx->seq;
-	TAILQ_HEAD(, spdk_bs_request_set) requests;
+	struct spdk_bs_channel *ch = set->channel;
 	spdk_bs_user_op_t *op;
 
-	TAILQ_INIT(&requests);
-	TAILQ_SWAP(&set->channel->need_cluster_alloc, &requests, spdk_bs_request_set, link);
+	/* Remove this ctx from the channel's inflight list so subsequent
+	 * cluster_allocs for this (blob, cluster_number) start fresh — though
+	 * by the time waiters re-enter, the cluster is already allocated and
+	 * they bypass bs_allocate_and_copy_cluster entirely. */
+	TAILQ_REMOVE(&ch->inflight_cluster_allocs, ctx, ch_link);
 
-	while (!TAILQ_EMPTY(&requests)) {
-		op = TAILQ_FIRST(&requests);
-		TAILQ_REMOVE(&requests, op, link);
+	while (!TAILQ_EMPTY(&ctx->waiters)) {
+		op = TAILQ_FIRST(&ctx->waiters);
+		TAILQ_REMOVE(&ctx->waiters, op, link);
 		if (bserrno == 0) {
 			bs_user_op_execute(op);
 		} else {
@@ -2832,6 +2846,7 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 		}
 	}
 
+	spdk_free(ctx->new_cluster_page);
 	spdk_free(ctx->buf);
 	free(ctx);
 }
@@ -3015,20 +3030,29 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 
 	ch = spdk_io_channel_get_ctx(_ch);
 
-	if (!TAILQ_EMPTY(&ch->need_cluster_alloc)) {
-		/* There are already operations pending. Queue this user op
-		 * and return because it will be re-executed when the outstanding
-		 * cluster allocation completes. */
-		TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
-		return;
-	}
-
 	/* Round the io_unit offset down to the first io_unit in the cluster */
 	cluster_start_io_unit = bs_io_unit_to_cluster_start(blob, io_unit);
 
 	/* Calculate which index in the metadata cluster array the corresponding
 	 * cluster is supposed to be at. */
 	cluster_number = bs_io_unit_to_cluster_number(blob, io_unit);
+
+	{
+		/* If a cluster_alloc is already in flight on this channel for the
+		 * same (blob, cluster_number) pair, attach this op to its waiters
+		 * list. The waiters get re-executed when the alloc completes; by
+		 * then bs_io_unit_is_allocated() returns true so they bypass this
+		 * function entirely on retry. Other (blob, cluster_number) pairs
+		 * proceed in parallel. */
+		struct spdk_blob_copy_cluster_ctx *inflight;
+		TAILQ_FOREACH(inflight, &ch->inflight_cluster_allocs, ch_link) {
+			if (inflight->blob == blob &&
+			    inflight->cluster_number == cluster_number) {
+				TAILQ_INSERT_TAIL(&inflight->waiters, op, link);
+				return;
+			}
+		}
+	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -3040,8 +3064,15 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 
 	ctx->blob = blob;
 	ctx->io_unit = cluster_start_io_unit;
-	ctx->new_cluster_page = ch->new_cluster_page;
-	memset(ctx->new_cluster_page, 0, blob->bs->md_page_size);
+	ctx->cluster_number = cluster_number;
+	TAILQ_INIT(&ctx->waiters);
+	ctx->new_cluster_page = spdk_zmalloc(blob->bs->md_page_size, 0, NULL,
+					     SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->new_cluster_page) {
+		free(ctx);
+		bs_user_op_abort(op, -ENOMEM);
+		return;
+	}
 
 	/* Check if the cluster that we intend to do CoW for is valid for
 	 * the backing dev. For zeroes backing dev, it'll be always valid.
@@ -3062,6 +3093,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		if (!ctx->buf) {
 			SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
 				    blob->bs->cluster_sz);
+			spdk_free(ctx->new_cluster_page);
 			free(ctx);
 			bs_user_op_abort(op, -ENOMEM);
 			return;
@@ -3073,6 +3105,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 				 false);
 	spdk_spin_unlock(&blob->bs->used_lock);
 	if (rc != 0) {
+		spdk_free(ctx->new_cluster_page);
 		spdk_free(ctx->buf);
 		free(ctx);
 		bs_user_op_abort(op, rc);
@@ -3088,14 +3121,26 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		spdk_spin_lock(&blob->bs->used_lock);
 		bs_release_cluster(blob->bs, ctx->new_cluster);
 		spdk_spin_unlock(&blob->bs->used_lock);
+		spdk_free(ctx->new_cluster_page);
 		spdk_free(ctx->buf);
 		free(ctx);
 		bs_user_op_abort(op, -ENOMEM);
 		return;
 	}
 
-	/* Queue the user op to block other incoming operations */
-	TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
+	/* Track this allocation so subsequent ops for the same (blob,
+	 * cluster_number) can attach as waiters instead of starting a
+	 * duplicate. Different (blob, cluster_number) pairs proceed in
+	 * parallel — that's the win here. */
+	TAILQ_INSERT_TAIL(&ch->inflight_cluster_allocs, ctx, ch_link);
+
+	/* The op that triggered this allocation is itself a waiter — its
+	 * actual write must be deferred until the cluster is fully
+	 * allocated and zeroed. Re-executed via bs_user_op_execute on
+	 * completion, by which point bs_io_unit_is_allocated returns true
+	 * and the op falls through to the regular allocated-cluster write
+	 * path. */
+	TAILQ_INSERT_TAIL(&ctx->waiters, op, link);
 
 	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes) {
 		if (can_copy) {
@@ -3823,26 +3868,21 @@ bs_channel_create(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	channel->new_cluster_page = spdk_zmalloc(bs->md_page_size, 0, NULL, SPDK_ENV_NUMA_ID_ANY,
-				    SPDK_MALLOC_DMA);
-	if (!channel->new_cluster_page) {
-		SPDK_ERRLOG("Failed to allocate new cluster page\n");
-		free(channel->req_mem);
-		channel->dev->destroy_channel(channel->dev, channel->dev_channel);
-		return -1;
-	}
+	/* new_cluster_page is now allocated per-ctx in
+	 * bs_allocate_and_copy_cluster so concurrent allocations on
+	 * different (blob, cluster_number) pairs don't race on a shared
+	 * channel buffer. */
 
 	channel->release_cluster_page = spdk_zmalloc(bs->md_page_size, 0, NULL, SPDK_ENV_NUMA_ID_ANY,
 					SPDK_MALLOC_DMA);
 	if (!channel->release_cluster_page) {
 		SPDK_ERRLOG("Failed to allocate release cluster page\n");
-		spdk_free(channel->new_cluster_page);
 		free(channel->req_mem);
 		channel->dev->destroy_channel(channel->dev, channel->dev_channel);
 		return -1;
 	}
 
-	TAILQ_INIT(&channel->need_cluster_alloc);
+	TAILQ_INIT(&channel->inflight_cluster_allocs);
 	TAILQ_INIT(&channel->queued_io);
 	RB_INIT(&channel->esnap_channels);
 
@@ -3853,12 +3893,23 @@ static void
 bs_channel_destroy(void *io_device, void *ctx_buf)
 {
 	struct spdk_bs_channel *channel = ctx_buf;
+	struct spdk_blob_copy_cluster_ctx *ctx, *ctx_tmp;
 	spdk_bs_user_op_t *op;
 
-	while (!TAILQ_EMPTY(&channel->need_cluster_alloc)) {
-		op = TAILQ_FIRST(&channel->need_cluster_alloc);
-		TAILQ_REMOVE(&channel->need_cluster_alloc, op, link);
-		bs_user_op_abort(op, -EIO);
+	/* Abort all in-flight cluster allocations on this channel and any
+	 * ops queued on their waiters lists. The corresponding ctx is
+	 * normally freed in blob_allocate_and_copy_cluster_cpl after the
+	 * sequence completes; on channel-destroy we have to drop them. */
+	TAILQ_FOREACH_SAFE(ctx, &channel->inflight_cluster_allocs, ch_link, ctx_tmp) {
+		TAILQ_REMOVE(&channel->inflight_cluster_allocs, ctx, ch_link);
+		while (!TAILQ_EMPTY(&ctx->waiters)) {
+			op = TAILQ_FIRST(&ctx->waiters);
+			TAILQ_REMOVE(&ctx->waiters, op, link);
+			bs_user_op_abort(op, -EIO);
+		}
+		spdk_free(ctx->new_cluster_page);
+		spdk_free(ctx->buf);
+		free(ctx);
 	}
 
 	while (!TAILQ_EMPTY(&channel->queued_io)) {
@@ -3870,7 +3921,6 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 	blob_esnap_destroy_bs_channel(channel);
 
 	free(channel->req_mem);
-	spdk_free(channel->new_cluster_page);
 	spdk_free(channel->release_cluster_page);
 	channel->dev->destroy_channel(channel->dev, channel->dev_channel);
 }

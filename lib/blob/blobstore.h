@@ -223,6 +223,8 @@ struct spdk_blob_store {
 	void				*esnap_unload_cb_arg;
 };
 
+struct spdk_blob_copy_cluster_ctx;
+
 struct spdk_bs_channel {
 	struct spdk_bs_request_set	*req_mem;
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
@@ -232,10 +234,19 @@ struct spdk_bs_channel {
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
 
-	/* This page is only used during insert of a new cluster. */
-	struct spdk_blob_md_page	*new_cluster_page;
-
-	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
+	/* In-flight cluster allocations on this channel. Each entry is a
+	 * spdk_blob_copy_cluster_ctx with its own per-ctx new_cluster_page,
+	 * so concurrent allocations on different (blob, cluster_number) pairs
+	 * proceed in parallel. The serialise-on-the-channel-shared-page
+	 * model that this replaced gated all unallocated-cluster writes
+	 * behind whichever allocation was currently in flight, capping
+	 * thin-PVC prefill / snapshot-restore throughput. Entries are added
+	 * at allocation start and removed at allocation completion. New ops
+	 * for an already-in-flight (blob, cluster_number) attach to that
+	 * entry's waiters list instead of starting a duplicate allocation.
+	 */
+	TAILQ_HEAD(spdk_bs_inflight_cluster_allocs,
+		   spdk_blob_copy_cluster_ctx) inflight_cluster_allocs;
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 
 	/* This page is only used during release of an existing cluster. */
