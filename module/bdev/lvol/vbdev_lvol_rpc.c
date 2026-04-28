@@ -1630,6 +1630,7 @@ struct rpc_bdev_lvol_shallow_copy {
 	char *src_lvol_name;
 	char *dst_bdev_name;
 	struct rpc_cluster_list cluster_list;
+	uint32_t pipeline_depth;
 };
 
 struct rpc_bdev_lvol_shallow_copy_ctx {
@@ -1649,6 +1650,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_start_shallow_copy_de
 	{"src_lvol_name", offsetof(struct rpc_bdev_lvol_shallow_copy, src_lvol_name), spdk_json_decode_string},
 	{"dst_bdev_name", offsetof(struct rpc_bdev_lvol_shallow_copy, dst_bdev_name), spdk_json_decode_string},
 	{"clusters", offsetof(struct rpc_bdev_lvol_shallow_copy, cluster_list), decode_rpc_cluster_list, true},
+	{"pipeline_depth", offsetof(struct rpc_bdev_lvol_shallow_copy, pipeline_depth), spdk_json_decode_uint32, true},
 };
 
 static void
@@ -1732,7 +1734,7 @@ rpc_bdev_lvol_start_shallow_copy(struct spdk_jsonrpc_request *request,
 	ctx->status = status;
 
 	LIST_INSERT_HEAD(&g_shallow_copy_status_list, status, link);
-	rc = vbdev_lvol_shallow_copy(src_lvol, req.dst_bdev_name,
+	rc = vbdev_lvol_shallow_copy(src_lvol, req.dst_bdev_name, req.pipeline_depth,
 				     rpc_bdev_lvol_shallow_copy_status_cb, status,
 				     rpc_bdev_lvol_shallow_copy_cb, ctx);
 
@@ -1829,6 +1831,7 @@ rpc_bdev_lvol_start_range_shallow_copy(struct spdk_jsonrpc_request *request,
 	LIST_INSERT_HEAD(&g_shallow_copy_status_list, status, link);
 	rc = vbdev_lvol_range_shallow_copy(src_lvol, req.dst_bdev_name,
 					   ctx->clusters, req.cluster_list.num_clusters,
+					   req.pipeline_depth,
 					   rpc_bdev_lvol_shallow_copy_status_cb, status,
 					   rpc_bdev_lvol_shallow_copy_cb, ctx);
 

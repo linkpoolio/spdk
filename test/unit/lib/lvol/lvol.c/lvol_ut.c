@@ -269,6 +269,7 @@ spdk_blob_is_thin_provisioned(struct spdk_blob *blob)
 int
 spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			  spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+			  uint32_t pipeline_depth,
 			  spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			  spdk_blob_op_complete cb_fn, void *cb_arg)
 {
@@ -279,7 +280,7 @@ spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 int
 spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 				spdk_blob_id blobid, uint64_t *clusters_indexes, uint64_t cluster_count,
-				struct spdk_bs_dev *ext_dev,
+				struct spdk_bs_dev *ext_dev, uint32_t pipeline_depth,
 				spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 				spdk_blob_op_complete cb_fn, void *cb_arg)
 {
@@ -3597,16 +3598,16 @@ lvol_shallow_copy(void)
 
 	/* Successful shallow copy */
 	g_blob_read_only = true;
-	rc = spdk_lvol_shallow_copy(g_lvol, &ext_dev, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_shallow_copy(g_lvol, &ext_dev, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvserrno == 0);
 
 	/* Shallow copy with null lvol */
-	rc = spdk_lvol_shallow_copy(NULL, &ext_dev, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_shallow_copy(NULL, &ext_dev, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Shallow copy with null ext_dev */
-	rc = spdk_lvol_shallow_copy(g_lvol, NULL, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_shallow_copy(g_lvol, NULL, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	spdk_lvol_close(g_lvol, op_complete, NULL);
@@ -3657,16 +3658,16 @@ lvol_range_shallow_copy(void)
 
 	/* Successful range shallow copy */
 	g_blob_read_only = true;
-	rc = spdk_lvol_range_shallow_copy(g_lvol, NULL, 0, &ext_dev, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_range_shallow_copy(g_lvol, NULL, 0, &ext_dev, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvserrno == 0);
 
 	/* Range shallow copy with null lvol */
-	rc = spdk_lvol_range_shallow_copy(NULL, NULL, 0, &ext_dev, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_range_shallow_copy(NULL, NULL, 0, &ext_dev, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Range shallow copy with null ext_dev */
-	rc = spdk_lvol_range_shallow_copy(g_lvol, NULL, 0, NULL, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_range_shallow_copy(g_lvol, NULL, 0, NULL, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	spdk_lvol_close(g_lvol, op_complete, NULL);
@@ -3726,7 +3727,7 @@ lvol_deep_copy(void)
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Deep copy with null ext_dev */
-	rc = spdk_lvol_shallow_copy(g_lvol, NULL, NULL, NULL, op_complete, NULL);
+	rc = spdk_lvol_shallow_copy(g_lvol, NULL, 0, NULL, NULL, op_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	spdk_lvol_close(g_lvol, op_complete, NULL);

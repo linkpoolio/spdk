@@ -863,6 +863,9 @@ void spdk_bs_blob_detach_parent(struct spdk_blob_store *bs, spdk_blob_id blobid,
  * \param channel IO channel used to copy the blob.
  * \param blobid The id of the blob.
  * \param ext_dev The device to copy on
+ * \param pipeline_depth Maximum number of clusters in flight (0 = default 1).
+ *        Each in-flight slot holds a cluster-sized DMA buffer, so peak memory
+ *        usage is pipeline_depth * cluster_sz.
  * \param status_cb_fn Called repeatedly during operation with status updates
  * \param status_cb_arg Argument passed to function status_cb_fn.
  * \param cb_fn Called when the operation is complete.
@@ -872,6 +875,7 @@ void spdk_bs_blob_detach_parent(struct spdk_blob_store *bs, spdk_blob_id blobid,
  */
 int spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			      spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+			      uint32_t pipeline_depth,
 			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			      spdk_blob_op_complete cb_fn, void *cb_arg);
 
@@ -890,6 +894,9 @@ int spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel
  * \param clusters_indexes The array containing the indexes of the clusters to be synchronized.
  * \param cluster_count The number of clusters into the index array.
  * \param ext_dev The device to copy on
+ * \param pipeline_depth Maximum number of clusters in flight (0 = default 1).
+ *        Each in-flight slot holds a cluster-sized DMA buffer, so peak memory
+ *        usage is pipeline_depth * cluster_sz.
  * \param status_cb_fn Called repeatedly during operation with status updates
  * \param status_cb_arg Argument passed to function status_cb_fn.
  * \param cb_fn Called when the operation is complete.
@@ -899,7 +906,7 @@ int spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel
  */
 int spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 				    spdk_blob_id blobid, uint64_t *clusters_indexes, uint64_t cluster_count,
-				    struct spdk_bs_dev *ext_dev,
+				    struct spdk_bs_dev *ext_dev, uint32_t pipeline_depth,
 				    spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 				    spdk_blob_op_complete cb_fn, void *cb_arg);
 /**

@@ -9938,7 +9938,7 @@ blob_shallow_copy(void)
 
 	/* Shallow copy with a not read only blob */
 	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN);
-	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev,
+	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev, 0,
 				       blob_shallow_copy_status_cb, NULL,
 				       blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -9954,7 +9954,7 @@ blob_shallow_copy(void)
 
 	/* Shallow copy over a spdk_bs_dev with incorrect size */
 	ext_dev = init_ext_dev(1, DEV_BUFFER_BLOCKLEN);
-	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev,
+	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev, 0,
 				       blob_shallow_copy_status_cb, NULL,
 				       blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -9964,7 +9964,7 @@ blob_shallow_copy(void)
 
 	/* Shallow copy over a spdk_bs_dev with incorrect block len */
 	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN * 2);
-	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev,
+	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev, 0,
 				       blob_shallow_copy_status_cb, NULL,
 				       blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -9985,7 +9985,7 @@ blob_shallow_copy(void)
 	}
 
 	/* Correct shallow copy of blob over bdev */
-	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev,
+	rc = spdk_bs_blob_shallow_copy(bs, blob_ch, blobid, ext_dev, 0,
 				       blob_shallow_copy_status_cb, NULL,
 				       blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -10108,7 +10108,7 @@ blob_range_shallow_copy(void)
 	/* Shallow copy with a not read only blob */
 	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN);
 	rc = spdk_bs_blob_range_shallow_copy(bs, blob_ch, blobid,
-					     clusters_indexes, 3, ext_dev,
+					     clusters_indexes, 3, ext_dev, 0,
 					     blob_shallow_copy_status_cb, NULL,
 					     blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -10125,7 +10125,7 @@ blob_range_shallow_copy(void)
 	/* Shallow copy over a spdk_bs_dev with incorrect size */
 	ext_dev = init_ext_dev(1, DEV_BUFFER_BLOCKLEN);
 	rc = spdk_bs_blob_range_shallow_copy(bs, blob_ch, blobid,
-					     clusters_indexes, 3, ext_dev,
+					     clusters_indexes, 3, ext_dev, 0,
 					     blob_shallow_copy_status_cb, NULL,
 					     blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -10136,7 +10136,7 @@ blob_range_shallow_copy(void)
 	/* Shallow copy over a spdk_bs_dev with incorrect block len */
 	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN * 2);
 	rc = spdk_bs_blob_range_shallow_copy(bs, blob_ch, blobid,
-					     clusters_indexes, 3, ext_dev,
+					     clusters_indexes, 3, ext_dev, 0,
 					     blob_shallow_copy_status_cb, NULL,
 					     blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -10149,7 +10149,7 @@ blob_range_shallow_copy(void)
 	ext_dev = init_ext_dev(num_clusters * 1024 * 1024, DEV_BUFFER_BLOCKLEN);
 	ext_dev->unmap = NULL;
 	rc = spdk_bs_blob_range_shallow_copy(bs, blob_ch, blobid,
-					     clusters_indexes, 3, ext_dev,
+					     clusters_indexes, 3, ext_dev, 0,
 					     blob_shallow_copy_status_cb, NULL,
 					     blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -10171,7 +10171,7 @@ blob_range_shallow_copy(void)
 
 	/* Correct shallow copy of blob over bdev */
 	rc = spdk_bs_blob_range_shallow_copy(bs, blob_ch, blobid,
-					     clusters_indexes, 3, ext_dev,
+					     clusters_indexes, 3, ext_dev, 0,
 					     blob_shallow_copy_status_cb, NULL,
 					     blob_op_complete, NULL);
 	CU_ASSERT(rc == 0);
