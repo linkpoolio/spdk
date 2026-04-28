@@ -46,6 +46,18 @@ static void blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint
 				   struct spdk_blob_md_page *page, spdk_blob_op_complete cb_fn, void *cb_arg);
 static void blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/* Maximum concurrent cluster allocations in flight on a single channel.
+ * Each in-flight ctx with a CoW parent holds a cluster_sz DMA buffer
+ * (256 MiB at our blobstore cluster size), so unbounded parallelism would
+ * blow past the SPDK hugepage budget on small --mem-size consumers (e.g.
+ * the 2 GiB engine-only nodes). 4 = up to 1 GiB of CoW buffers in flight,
+ * which still gives a meaningful win for fresh-PVC prefill workloads
+ * over the previous strict serialiser while staying within budget on
+ * every node profile we ship. Ops that arrive when the channel is at
+ * the cap queue on overflow_ops and are drained as in-flight allocs
+ * complete. */
+#define SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS 4
+
 static void bs_shallow_copy_cluster_find_next(void *cb_arg);
 static void bs_range_shallow_copy_cluster_handle_next(void *cb_arg);
 static void bs_deep_copy_cluster_find_next(void *cb_arg);
@@ -2835,6 +2847,8 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 	 * by the time waiters re-enter, the cluster is already allocated and
 	 * they bypass bs_allocate_and_copy_cluster entirely. */
 	TAILQ_REMOVE(&ch->inflight_cluster_allocs, ctx, ch_link);
+	assert(ch->inflight_cluster_alloc_count > 0);
+	ch->inflight_cluster_alloc_count--;
 
 	while (!TAILQ_EMPTY(&ctx->waiters)) {
 		op = TAILQ_FIRST(&ctx->waiters);
@@ -2849,6 +2863,21 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 	spdk_free(ctx->new_cluster_page);
 	spdk_free(ctx->buf);
 	free(ctx);
+
+	/* Drain the channel's overflow_ops up to the cap. Each re-executed
+	 * op falls back into bs_allocate_and_copy_cluster, where it either
+	 * (a) becomes a fresh in-flight alloc (count incremented), (b)
+	 * attaches to an existing in-flight alloc as a waiter (no count
+	 * change), or (c) finds the cluster already allocated and bypasses
+	 * the function entirely. The cap check at the top of that function
+	 * stops the drain naturally; we only iterate while there's headroom
+	 * to start NEW allocs, so this isn't an unbounded loop. */
+	while (!TAILQ_EMPTY(&ch->overflow_ops) &&
+	       ch->inflight_cluster_alloc_count < SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS) {
+		op = TAILQ_FIRST(&ch->overflow_ops);
+		TAILQ_REMOVE(&ch->overflow_ops, op, link);
+		bs_user_op_execute(op);
+	}
 }
 
 static void
@@ -3054,6 +3083,15 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		}
 	}
 
+	/* Cap concurrent cluster allocations on this channel so total CoW
+	 * buffer usage stays bounded — see SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS.
+	 * Ops that arrive over the cap queue on overflow_ops and are
+	 * re-executed as in-flight allocs complete. */
+	if (ch->inflight_cluster_alloc_count >= SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS) {
+		TAILQ_INSERT_TAIL(&ch->overflow_ops, op, link);
+		return;
+	}
+
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		bs_user_op_abort(op, -ENOMEM);
@@ -3133,6 +3171,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	 * duplicate. Different (blob, cluster_number) pairs proceed in
 	 * parallel — that's the win here. */
 	TAILQ_INSERT_TAIL(&ch->inflight_cluster_allocs, ctx, ch_link);
+	ch->inflight_cluster_alloc_count++;
 
 	/* The op that triggered this allocation is itself a waiter — its
 	 * actual write must be deferred until the cluster is fully
@@ -3883,6 +3922,8 @@ bs_channel_create(void *io_device, void *ctx_buf)
 	}
 
 	TAILQ_INIT(&channel->inflight_cluster_allocs);
+	channel->inflight_cluster_alloc_count = 0;
+	TAILQ_INIT(&channel->overflow_ops);
 	TAILQ_INIT(&channel->queued_io);
 	RB_INIT(&channel->esnap_channels);
 
@@ -3910,6 +3951,14 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 		spdk_free(ctx->new_cluster_page);
 		spdk_free(ctx->buf);
 		free(ctx);
+	}
+	channel->inflight_cluster_alloc_count = 0;
+
+	/* Abort any ops queued on overflow_ops waiting for an in-flight slot. */
+	while (!TAILQ_EMPTY(&channel->overflow_ops)) {
+		op = TAILQ_FIRST(&channel->overflow_ops);
+		TAILQ_REMOVE(&channel->overflow_ops, op, link);
+		bs_user_op_abort(op, -EIO);
 	}
 
 	while (!TAILQ_EMPTY(&channel->queued_io)) {
