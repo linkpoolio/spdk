@@ -1960,7 +1960,15 @@ struct spdk_blob_persist_ctx {
 
 	struct spdk_blob_md_page	*pages;
 	uint32_t			next_extent_page;
-	struct spdk_blob_md_page	*extent_page;
+	/* Contiguous DMA buffer holding all dirty extent pages for this
+	 * persist sequence, written in a single bs_batch instead of one
+	 * sequential round-trip per page. extent_page_lbas[i] is the LBA
+	 * for extent_pages[i]; num_extent_pages_to_write is the count.
+	 * All three are NULL/0 outside the brief window where they're being
+	 * built and submitted. */
+	struct spdk_blob_md_page	*extent_pages;
+	uint64_t			*extent_page_lbas;
+	size_t				num_extent_pages_to_write;
 
 	spdk_bs_sequence_t		*seq;
 	spdk_bs_sequence_cpl		cb_fn;
@@ -2040,6 +2048,18 @@ blob_persist_complete_cb(void *arg)
 
 	/* Free the memory */
 	spdk_free(ctx->pages);
+	/* Defensive: extent_pages/extent_page_lbas are normally freed by
+	 * blob_persist_extent_pages_batch_cpl (success) or the inline
+	 * cleanup in blob_persist_write_extent_pages (alloc failure). On
+	 * any path where we reach here without those running (e.g. a
+	 * pending-persist that never started its own extent-pages phase),
+	 * the fields are NULL and these calls are no-ops. */
+	if (ctx->extent_pages != NULL) {
+		spdk_free(ctx->extent_pages);
+	}
+	if (ctx->extent_page_lbas != NULL) {
+		free(ctx->extent_page_lbas);
+	}
 	free(ctx);
 }
 
@@ -2601,53 +2621,126 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 }
 
 static void
-blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+blob_persist_extent_pages_free(struct spdk_blob_persist_ctx *ctx)
 {
-	struct spdk_blob_persist_ctx	*ctx = cb_arg;
-	struct spdk_blob		*blob = ctx->blob;
-	size_t				i;
-	uint32_t			extent_page_id;
-	uint32_t                        page_count = 0;
-	int				rc;
-
-	if (ctx->extent_page != NULL) {
-		spdk_free(ctx->extent_page);
-		ctx->extent_page = NULL;
+	if (ctx->extent_pages != NULL) {
+		spdk_free(ctx->extent_pages);
+		ctx->extent_pages = NULL;
 	}
+	if (ctx->extent_page_lbas != NULL) {
+		free(ctx->extent_page_lbas);
+		ctx->extent_page_lbas = NULL;
+	}
+	ctx->num_extent_pages_to_write = 0;
+}
+
+static void
+blob_persist_extent_pages_batch_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx *ctx = cb_arg;
+
+	blob_persist_extent_pages_free(ctx);
 
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}
 
-	/* Only write out Extent Pages when blob was resized. */
+	blob_persist_generate_new_md(ctx);
+}
+
+static void
+blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	spdk_bs_batch_t			*batch;
+	size_t				i;
+	size_t				out_idx = 0;
+	size_t				n_to_write = 0;
+	uint32_t			extent_page_id;
+	uint32_t			page_count = 0;
+	int				rc;
+
+	if (bserrno != 0) {
+		blob_persist_complete(seq, ctx, bserrno);
+		return;
+	}
+
+	/* Count how many dirty extent pages this persist sequence will write
+	 * so we can pre-allocate one contiguous DMA buffer + LBA array, then
+	 * issue all writes as a single bs_batch instead of N serial round-
+	 * trips (which was the cluster_alloc throughput ceiling on resize-up
+	 * workloads — rebuild and fresh-PVC prefill). */
 	for (i = ctx->next_extent_page; i < blob->active.extent_pages_array_size; i++) {
+		if (blob->active.extent_pages[i] != 0) {
+			n_to_write++;
+		}
+	}
+	if (n_to_write == 0) {
+		/* Resize-up case where every newly-added extent page is
+		 * thin (no clusters) — nothing to write, skip straight to MD. */
+		blob_persist_generate_new_md(ctx);
+		return;
+	}
+
+	ctx->extent_page_lbas = calloc(n_to_write, sizeof(*ctx->extent_page_lbas));
+	if (ctx->extent_page_lbas == NULL) {
+		blob_persist_complete(seq, ctx, -ENOMEM);
+		return;
+	}
+	ctx->num_extent_pages_to_write = n_to_write;
+
+	/* Build the contiguous extent-page buffer. blob_serialize_add_page
+	 * uses spdk_realloc to grow ctx->extent_pages so all serialized pages
+	 * end up in one DMA-mapped allocation we can submit as separate
+	 * bs_batch_write_dev ops with different LBAs. */
+	for (i = ctx->next_extent_page; i < blob->active.extent_pages_array_size; i++) {
+		struct spdk_blob_md_page *page;
+
 		extent_page_id = blob->active.extent_pages[i];
 		if (extent_page_id == 0) {
-			/* No Extent Page to persist */
 			assert(spdk_blob_is_thin_provisioned(blob));
 			continue;
 		}
 		assert(spdk_bit_array_get(blob->bs->used_md_pages, extent_page_id));
-		ctx->next_extent_page = i + 1;
-		rc = blob_serialize_add_page(ctx->blob, &ctx->extent_page, &page_count, &ctx->extent_page);
+
+		rc = blob_serialize_add_page(blob, &ctx->extent_pages, &page_count, &page);
 		if (rc < 0) {
+			blob_persist_extent_pages_free(ctx);
 			blob_persist_complete(seq, ctx, rc);
 			return;
 		}
 
-		blob->state = SPDK_BLOB_STATE_DIRTY;
-		blob_serialize_extent_page(blob, i * SPDK_EXTENTS_PER_EP, ctx->extent_page);
+		blob_serialize_extent_page(blob, i * SPDK_EXTENTS_PER_EP, page);
+		page->crc = blob_md_page_calc_crc(page);
 
-		ctx->extent_page->crc = blob_md_page_calc_crc(ctx->extent_page);
-
-		bs_sequence_write_dev(seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
-				      bs_byte_to_lba(blob->bs, blob->bs->md_page_size),
-				      blob_persist_write_extent_pages, ctx);
-		return;
+		ctx->extent_page_lbas[out_idx++] = bs_md_page_to_lba(blob->bs, extent_page_id);
 	}
+	assert(out_idx == n_to_write);
+	/* All dirty extent pages serialized; advance cursor past the end so a
+	 * future re-entry (which can't currently happen but matches the field's
+	 * documented semantic) wouldn't re-issue them. */
+	ctx->next_extent_page = i;
 
-	blob_persist_generate_new_md(ctx);
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+
+	/* Issue all extent-page writes in parallel via a single bs_batch.
+	 * Crash-consistency: this is the same happens-before window the
+	 * serial chain provided — every extent page must hit disk before the
+	 * root-MD commit in blob_persist_write_page_root, which still runs
+	 * only after blob_persist_extent_pages_batch_cpl → generate_new_md →
+	 * write_page_chain → write_page_root completes. Order WITHIN the
+	 * extent-page set doesn't matter; the pages are independent and only
+	 * become visible together via the root-MD commit. */
+	batch = bs_sequence_to_batch(seq, blob_persist_extent_pages_batch_cpl, ctx);
+	for (i = 0; i < ctx->num_extent_pages_to_write; i++) {
+		struct spdk_blob_md_page *page = &ctx->extent_pages[i];
+		bs_batch_write_dev(batch, page,
+				   ctx->extent_page_lbas[i],
+				   bs_byte_to_lba(blob->bs, blob->bs->md_page_size));
+	}
+	bs_batch_close(batch);
 }
 
 static void
