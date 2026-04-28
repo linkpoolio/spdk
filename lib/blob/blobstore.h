@@ -237,25 +237,17 @@ struct spdk_bs_channel {
 	/* In-flight cluster allocations on this channel. Each entry is a
 	 * spdk_blob_copy_cluster_ctx with its own per-ctx new_cluster_page,
 	 * so concurrent allocations on different (blob, cluster_number) pairs
-	 * proceed in parallel. The serialise-on-the-channel-shared-page
-	 * model that this replaced gated all unallocated-cluster writes
-	 * behind whichever allocation was currently in flight, capping
-	 * thin-PVC prefill / snapshot-restore throughput. Entries are added
-	 * at allocation start and removed at allocation completion. New ops
-	 * for an already-in-flight (blob, cluster_number) attach to that
-	 * entry's waiters list instead of starting a duplicate allocation.
+	 * proceed in parallel. New ops for an already-in-flight
+	 * (blob, cluster_number) attach to that entry's waiters list instead
+	 * of starting a duplicate allocation.
 	 *
-	 * Concurrency is capped at SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS to
-	 * bound DMA buffer usage: each ctx with a CoW parent allocates a
-	 * cluster_sz buffer (e.g. 256 MiB at our blobstore cluster size),
-	 * and unbounded parallelism would exhaust the SPDK hugepage budget
-	 * on small --mem-size consumers. Ops that arrive while the channel
-	 * is at the cap queue on overflow_ops; they're drained in arrival
-	 * order as in-flight allocs complete.
+	 * CoW DMA buffer concurrency is gated by spdk_malloc success/failure,
+	 * not a fixed cap — overflow_ops queues ops whose cluster_sz buffer
+	 * allocation failed; the queue drains on the next CoW completion when
+	 * a buffer is freed. Self-tunes to actual hugepage availability.
 	 */
 	TAILQ_HEAD(spdk_bs_inflight_cluster_allocs,
 		   spdk_blob_copy_cluster_ctx) inflight_cluster_allocs;
-	uint32_t			inflight_cluster_alloc_count;
 	TAILQ_HEAD(, spdk_bs_request_set) overflow_ops;
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 

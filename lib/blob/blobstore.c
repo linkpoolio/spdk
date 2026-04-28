@@ -46,18 +46,21 @@ static void blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint
 				   struct spdk_blob_md_page *page, spdk_blob_op_complete cb_fn, void *cb_arg);
 static void blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
-/* Maximum concurrent CoW-buffer cluster allocations in flight on a
- * single channel. The cap is *scoped to allocations that need a
- * cluster_sz DMA buffer for read-from-parent CoW* — i.e. only ESNAP-clone
- * blobs with a non-zero parent. Fresh-PVC writes (no parent) and
- * is_zeroes / can_copy fast-paths bypass the cap entirely because they
- * never allocate the 256 MiB DMA buffer that the cap is meant to bound.
+/* CoW DMA buffer concurrency is driven by spdk_malloc success/failure,
+ * not by a fixed cap. Each ESNAP-rebuild cluster_alloc tries to allocate
+ * a cluster_sz buffer (256 MiB at our cluster size); if the SPDK hugepage
+ * heap is full, the alloc fails and we queue the op on the channel's
+ * overflow_ops list. When an in-flight CoW alloc completes, it frees its
+ * buffer and drains overflow_ops by re-executing each queued op — the
+ * retry goes through bs_allocate_and_copy_cluster again, now with one
+ * fewer 256 MiB buffer outstanding so the malloc succeeds (or re-queues
+ * if memory is still tight, picked up by the next completion).
  *
- * 64 = up to 16 GiB of CoW buffers in flight at our 256 MiB cluster
- * size, fits within the 16 GiB hugepage budget on storage-bearing
- * workers (which is where ESNAP-rebuild traffic concentrates anyway —
- * engine-only consumers don't run rebuild-target lvols). */
-#define SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS 64
+ * Self-tuning across node profiles: storage workers with 16 GiB hugepages
+ * sustain more parallel rebuilds than engine-only nodes with 2 GiB
+ * before backpressure kicks in, but neither needs an explicit cap. Fresh-
+ * PVC writes (no parent / is_zeroes parent / can_copy passthrough) skip
+ * the buffer allocation entirely and never trigger this path. */
 
 static void bs_shallow_copy_cluster_find_next(void *cb_arg);
 static void bs_range_shallow_copy_cluster_handle_next(void *cb_arg);
@@ -2846,14 +2849,8 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 	/* Remove this ctx from the channel's inflight list so subsequent
 	 * cluster_allocs for this (blob, cluster_number) start fresh — though
 	 * by the time waiters re-enter, the cluster is already allocated and
-	 * they bypass bs_allocate_and_copy_cluster entirely. Decrement the
-	 * cap counter only if this ctx actually consumed a CoW buffer (matching
-	 * the conditional increment in bs_allocate_and_copy_cluster). */
+	 * they bypass bs_allocate_and_copy_cluster entirely. */
 	TAILQ_REMOVE(&ch->inflight_cluster_allocs, ctx, ch_link);
-	if (ctx->buf != NULL) {
-		assert(ch->inflight_cluster_alloc_count > 0);
-		ch->inflight_cluster_alloc_count--;
-	}
 
 	while (!TAILQ_EMPTY(&ctx->waiters)) {
 		op = TAILQ_FIRST(&ctx->waiters);
@@ -2869,19 +2866,22 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 	spdk_free(ctx->buf);
 	free(ctx);
 
-	/* Drain the channel's overflow_ops up to the cap. Each re-executed
-	 * op falls back into bs_allocate_and_copy_cluster, where it either
-	 * (a) becomes a fresh in-flight alloc (count incremented), (b)
-	 * attaches to an existing in-flight alloc as a waiter (no count
-	 * change), or (c) finds the cluster already allocated and bypasses
-	 * the function entirely. The cap check at the top of that function
-	 * stops the drain naturally; we only iterate while there's headroom
-	 * to start NEW allocs, so this isn't an unbounded loop. */
-	while (!TAILQ_EMPTY(&ch->overflow_ops) &&
-	       ch->inflight_cluster_alloc_count < SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS) {
-		op = TAILQ_FIRST(&ch->overflow_ops);
-		TAILQ_REMOVE(&ch->overflow_ops, op, link);
-		bs_user_op_execute(op);
+	/* Drain the channel's overflow_ops. We just freed a cluster_sz CoW
+	 * DMA buffer (if this ctx had one), so retries should now succeed.
+	 * Snapshot-then-drain to a local list so re-queues land in the
+	 * fresh ch->overflow_ops and are picked up on the NEXT completion
+	 * — prevents an unbounded loop if memory is still tight enough that
+	 * malloc fails for some retried ops. */
+	{
+		TAILQ_HEAD(, spdk_bs_request_set) drain;
+		spdk_bs_user_op_t *next_op;
+		TAILQ_INIT(&drain);
+		TAILQ_SWAP(&ch->overflow_ops, &drain, spdk_bs_request_set, link);
+		while (!TAILQ_EMPTY(&drain)) {
+			next_op = TAILQ_FIRST(&drain);
+			TAILQ_REMOVE(&drain, next_op, link);
+			bs_user_op_execute(next_op);
+		}
 	}
 }
 
@@ -3089,11 +3089,10 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		}
 	}
 
-	/* Compute the CoW-buffer-need predicate up front so we can scope the
-	 * concurrency cap to allocations that actually consume a cluster_sz
-	 * DMA buffer (the only thing the cap is meant to protect against).
-	 * Fresh-PVC writes (no parent), is_zeroes parents, and can_copy
-	 * passthrough don't allocate the buffer and so don't need throttling. */
+	/* Compute CoW-buffer-need predicate. Only ESNAP-clone blobs with a
+	 * non-zeroes, non-copy-fast-path parent allocate the cluster_sz DMA
+	 * buffer; everyone else (fresh PVC, zero parent, can_copy) skips the
+	 * buffer and never hits backpressure. */
 	is_valid_range = blob->back_bs_dev->is_range_valid(blob->back_bs_dev,
 			 bs_dev_io_unit_to_lba(blob, blob->back_bs_dev, cluster_start_io_unit),
 			 bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
@@ -3102,15 +3101,6 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 			bs_dev_io_unit_to_lba(blob, blob->back_bs_dev, cluster_start_io_unit),
 			bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
 	needs_cow_buf = blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes && !can_copy;
-
-	/* Cap only the CoW-buffer path. Allocations that don't need the
-	 * cluster_sz DMA buffer (fresh PVC, zero parent, can_copy) proceed
-	 * unbounded — there's no memory pressure to manage. */
-	if (needs_cow_buf &&
-	    ch->inflight_cluster_alloc_count >= SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS) {
-		TAILQ_INSERT_TAIL(&ch->overflow_ops, op, link);
-		return;
-	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -3136,10 +3126,20 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		ctx->buf = spdk_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen,
 				       NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->buf) {
-			SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
-				    blob->bs->cluster_sz);
+			/* CoW DMA buffer exhausted. If any CoW alloc is currently
+			 * in flight on this channel, queue this op on overflow_ops
+			 * — when one of those completes it'll free a cluster_sz
+			 * buffer and drain the overflow queue, retrying our op.
+			 * If nothing's in flight, there's no completion that will
+			 * fire to free memory; abort the op rather than hang. */
 			spdk_free(ctx->new_cluster_page);
 			free(ctx);
+			if (!TAILQ_EMPTY(&ch->inflight_cluster_allocs)) {
+				TAILQ_INSERT_TAIL(&ch->overflow_ops, op, link);
+				return;
+			}
+			SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed and no in-flight CoW alloc to free memory.\n",
+				    blob->bs->cluster_sz);
 			bs_user_op_abort(op, -ENOMEM);
 			return;
 		}
@@ -3175,16 +3175,10 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 
 	/* Track this allocation so subsequent ops for the same (blob,
 	 * cluster_number) can attach as waiters instead of starting a
-	 * duplicate. Different (blob, cluster_number) pairs proceed in
+	 * duplicate, and so the completion path can find it for overflow_ops
+	 * draining. Different (blob, cluster_number) pairs proceed in
 	 * parallel — that's the win here. */
 	TAILQ_INSERT_TAIL(&ch->inflight_cluster_allocs, ctx, ch_link);
-	/* Only count toward the cap if this allocation actually consumes a
-	 * cluster_sz CoW DMA buffer. Non-CoW allocs (no parent / is_zeroes /
-	 * can_copy) don't allocate the buffer, so they don't contribute to
-	 * memory pressure and shouldn't be throttled. */
-	if (ctx->buf != NULL) {
-		ch->inflight_cluster_alloc_count++;
-	}
 
 	/* The op that triggered this allocation is itself a waiter — its
 	 * actual write must be deferred until the cluster is fully
@@ -3935,7 +3929,6 @@ bs_channel_create(void *io_device, void *ctx_buf)
 	}
 
 	TAILQ_INIT(&channel->inflight_cluster_allocs);
-	channel->inflight_cluster_alloc_count = 0;
 	TAILQ_INIT(&channel->overflow_ops);
 	TAILQ_INIT(&channel->queued_io);
 	RB_INIT(&channel->esnap_channels);
@@ -3965,9 +3958,8 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 		spdk_free(ctx->buf);
 		free(ctx);
 	}
-	channel->inflight_cluster_alloc_count = 0;
 
-	/* Abort any ops queued on overflow_ops waiting for an in-flight slot. */
+	/* Abort any ops queued on overflow_ops waiting for memory to free up. */
 	while (!TAILQ_EMPTY(&channel->overflow_ops)) {
 		op = TAILQ_FIRST(&channel->overflow_ops);
 		TAILQ_REMOVE(&channel->overflow_ops, op, link);
