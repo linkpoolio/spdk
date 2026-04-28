@@ -46,17 +46,18 @@ static void blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint
 				   struct spdk_blob_md_page *page, spdk_blob_op_complete cb_fn, void *cb_arg);
 static void blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
-/* Maximum concurrent cluster allocations in flight on a single channel.
- * Each in-flight ctx with a CoW parent holds a cluster_sz DMA buffer
- * (256 MiB at our blobstore cluster size), so unbounded parallelism would
- * blow past the SPDK hugepage budget on small --mem-size consumers (e.g.
- * the 2 GiB engine-only nodes). 4 = up to 1 GiB of CoW buffers in flight,
- * which still gives a meaningful win for fresh-PVC prefill workloads
- * over the previous strict serialiser while staying within budget on
- * every node profile we ship. Ops that arrive when the channel is at
- * the cap queue on overflow_ops and are drained as in-flight allocs
- * complete. */
-#define SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS 4
+/* Maximum concurrent CoW-buffer cluster allocations in flight on a
+ * single channel. The cap is *scoped to allocations that need a
+ * cluster_sz DMA buffer for read-from-parent CoW* — i.e. only ESNAP-clone
+ * blobs with a non-zero parent. Fresh-PVC writes (no parent) and
+ * is_zeroes / can_copy fast-paths bypass the cap entirely because they
+ * never allocate the 256 MiB DMA buffer that the cap is meant to bound.
+ *
+ * 64 = up to 16 GiB of CoW buffers in flight at our 256 MiB cluster
+ * size, fits within the 16 GiB hugepage budget on storage-bearing
+ * workers (which is where ESNAP-rebuild traffic concentrates anyway —
+ * engine-only consumers don't run rebuild-target lvols). */
+#define SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS 64
 
 static void bs_shallow_copy_cluster_find_next(void *cb_arg);
 static void bs_range_shallow_copy_cluster_handle_next(void *cb_arg);
@@ -2845,10 +2846,14 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 	/* Remove this ctx from the channel's inflight list so subsequent
 	 * cluster_allocs for this (blob, cluster_number) start fresh — though
 	 * by the time waiters re-enter, the cluster is already allocated and
-	 * they bypass bs_allocate_and_copy_cluster entirely. */
+	 * they bypass bs_allocate_and_copy_cluster entirely. Decrement the
+	 * cap counter only if this ctx actually consumed a CoW buffer (matching
+	 * the conditional increment in bs_allocate_and_copy_cluster). */
 	TAILQ_REMOVE(&ch->inflight_cluster_allocs, ctx, ch_link);
-	assert(ch->inflight_cluster_alloc_count > 0);
-	ch->inflight_cluster_alloc_count--;
+	if (ctx->buf != NULL) {
+		assert(ch->inflight_cluster_alloc_count > 0);
+		ch->inflight_cluster_alloc_count--;
+	}
 
 	while (!TAILQ_EMPTY(&ctx->waiters)) {
 		op = TAILQ_FIRST(&ctx->waiters);
@@ -3054,6 +3059,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	bool is_zeroes;
 	bool can_copy;
 	bool is_valid_range;
+	bool needs_cow_buf;
 	uint64_t copy_src_lba;
 	int rc;
 
@@ -3083,11 +3089,25 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		}
 	}
 
-	/* Cap concurrent cluster allocations on this channel so total CoW
-	 * buffer usage stays bounded — see SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS.
-	 * Ops that arrive over the cap queue on overflow_ops and are
-	 * re-executed as in-flight allocs complete. */
-	if (ch->inflight_cluster_alloc_count >= SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS) {
+	/* Compute the CoW-buffer-need predicate up front so we can scope the
+	 * concurrency cap to allocations that actually consume a cluster_sz
+	 * DMA buffer (the only thing the cap is meant to protect against).
+	 * Fresh-PVC writes (no parent), is_zeroes parents, and can_copy
+	 * passthrough don't allocate the buffer and so don't need throttling. */
+	is_valid_range = blob->back_bs_dev->is_range_valid(blob->back_bs_dev,
+			 bs_dev_io_unit_to_lba(blob, blob->back_bs_dev, cluster_start_io_unit),
+			 bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
+	can_copy = is_valid_range && blob_can_copy(blob, cluster_start_io_unit, &copy_src_lba);
+	is_zeroes = is_valid_range && blob->back_bs_dev->is_zeroes(blob->back_bs_dev,
+			bs_dev_io_unit_to_lba(blob, blob->back_bs_dev, cluster_start_io_unit),
+			bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
+	needs_cow_buf = blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes && !can_copy;
+
+	/* Cap only the CoW-buffer path. Allocations that don't need the
+	 * cluster_sz DMA buffer (fresh PVC, zero parent, can_copy) proceed
+	 * unbounded — there's no memory pressure to manage. */
+	if (needs_cow_buf &&
+	    ch->inflight_cluster_alloc_count >= SPDK_BS_MAX_INFLIGHT_CLUSTER_ALLOCS) {
 		TAILQ_INSERT_TAIL(&ch->overflow_ops, op, link);
 		return;
 	}
@@ -3112,20 +3132,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		return;
 	}
 
-	/* Check if the cluster that we intend to do CoW for is valid for
-	 * the backing dev. For zeroes backing dev, it'll be always valid.
-	 * For other backing dev e.g. a snapshot, it could be invalid if
-	 * the blob has been resized after snapshot was taken. */
-	is_valid_range = blob->back_bs_dev->is_range_valid(blob->back_bs_dev,
-			 bs_dev_io_unit_to_lba(blob, blob->back_bs_dev, cluster_start_io_unit),
-			 bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
-
-	can_copy = is_valid_range && blob_can_copy(blob, cluster_start_io_unit, &copy_src_lba);
-
-	is_zeroes = is_valid_range && blob->back_bs_dev->is_zeroes(blob->back_bs_dev,
-			bs_dev_io_unit_to_lba(blob, blob->back_bs_dev, cluster_start_io_unit),
-			bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
-	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes && !can_copy) {
+	if (needs_cow_buf) {
 		ctx->buf = spdk_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen,
 				       NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->buf) {
@@ -3171,7 +3178,13 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	 * duplicate. Different (blob, cluster_number) pairs proceed in
 	 * parallel — that's the win here. */
 	TAILQ_INSERT_TAIL(&ch->inflight_cluster_allocs, ctx, ch_link);
-	ch->inflight_cluster_alloc_count++;
+	/* Only count toward the cap if this allocation actually consumes a
+	 * cluster_sz CoW DMA buffer. Non-CoW allocs (no parent / is_zeroes /
+	 * can_copy) don't allocate the buffer, so they don't contribute to
+	 * memory pressure and shouldn't be throttled. */
+	if (ctx->buf != NULL) {
+		ch->inflight_cluster_alloc_count++;
+	}
 
 	/* The op that triggered this allocation is itself a waiter — its
 	 * actual write must be deferred until the cluster is fully
