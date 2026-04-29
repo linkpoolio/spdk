@@ -134,6 +134,112 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_examine", rpc_bdev_examine, SPDK_RPC_RUNTIME)
 
+/*
+ * bdev_write_zeroes — issue a write-zeroes operation against an arbitrary
+ * bdev. Used by callers (e.g. longhorn-spdk-engine) that need to clobber
+ * stale FS/partition magic on a freshly-created thick lvol when the
+ * underlying device doesn't honour zero-on-deallocate (NVMe DLFEAT bit 2
+ * unset). SPDK upstream exposes write_zeroes only via the data path; this
+ * RPC is a thin control-plane wrapper around spdk_bdev_write_zeroes so
+ * out-of-process callers can drive it.
+ */
+struct rpc_bdev_write_zeroes {
+	char		*name;
+	uint64_t	offset;
+	uint64_t	length;
+};
+
+static void
+free_rpc_bdev_write_zeroes(struct rpc_bdev_write_zeroes *r)
+{
+	free(r->name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_write_zeroes_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_write_zeroes, name), spdk_json_decode_string},
+	{"offset", offsetof(struct rpc_bdev_write_zeroes, offset), spdk_json_decode_uint64},
+	{"length", offsetof(struct rpc_bdev_write_zeroes, length), spdk_json_decode_uint64},
+};
+
+struct rpc_bdev_write_zeroes_ctx {
+	struct spdk_jsonrpc_request	*request;
+	struct spdk_bdev_desc		*desc;
+	struct spdk_io_channel		*ch;
+};
+
+static void
+rpc_bdev_write_zeroes_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct rpc_bdev_write_zeroes_ctx *ctx = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	spdk_put_io_channel(ctx->ch);
+	spdk_bdev_close(ctx->desc);
+
+	if (success) {
+		spdk_jsonrpc_send_bool_response(ctx->request, true);
+	} else {
+		spdk_jsonrpc_send_error_response(ctx->request, -EIO,
+						 "bdev_write_zeroes I/O failed");
+	}
+	free(ctx);
+}
+
+static void
+rpc_bdev_write_zeroes(struct spdk_jsonrpc_request *request,
+		      const struct spdk_json_val *params)
+{
+	struct rpc_bdev_write_zeroes req = {NULL, 0, 0};
+	struct rpc_bdev_write_zeroes_ctx *ctx = NULL;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_write_zeroes_decoders,
+				    SPDK_COUNTOF(rpc_bdev_write_zeroes_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		goto cleanup;
+	}
+	ctx->request = request;
+
+	rc = spdk_bdev_open_ext(req.name, true, dummy_bdev_event_cb, NULL, &ctx->desc);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		free(ctx);
+		ctx = NULL;
+		goto cleanup;
+	}
+
+	ctx->ch = spdk_bdev_get_io_channel(ctx->desc);
+	if (ctx->ch == NULL) {
+		spdk_bdev_close(ctx->desc);
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, "Failed to get IO channel");
+		free(ctx);
+		ctx = NULL;
+		goto cleanup;
+	}
+
+	rc = spdk_bdev_write_zeroes(ctx->desc, ctx->ch, req.offset, req.length,
+				    rpc_bdev_write_zeroes_complete, ctx);
+	if (rc != 0) {
+		spdk_put_io_channel(ctx->ch);
+		spdk_bdev_close(ctx->desc);
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		free(ctx);
+		ctx = NULL;
+		/* fallthrough to cleanup */
+	}
+
+cleanup:
+	free_rpc_bdev_write_zeroes(&req);
+}
+SPDK_RPC_REGISTER("bdev_write_zeroes", rpc_bdev_write_zeroes, SPDK_RPC_RUNTIME)
+
 struct rpc_get_iostat_ctx {
 	int bdev_count;
 	int rc;
