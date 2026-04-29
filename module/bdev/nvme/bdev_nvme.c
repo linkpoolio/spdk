@@ -765,18 +765,49 @@ _nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 	bdev_nvme_fini_done();
 }
 
+/*
+ * Maximum time to wait for spdk_nvme_detach_poll_async to complete before
+ * forcibly tearing down the nvme_ctrlr. Without this, a qpair stuck in
+ * deactivating (peer dropped TCP without finishing the disconnect handshake)
+ * leaves spdk_nvme_detach_poll_async returning -EAGAIN forever, the
+ * controller stays in state="deleting" forever, and any consumer trying to
+ * close the bdev (raid_bdev_destruct -> spdk_bdev_close, lvol close, etc.)
+ * hangs inside spdk_bdev_close. Ten seconds is well past the longest healthy
+ * detach we observe (sub-second under load) and well below any operational
+ * patience for "this controller is unrecoverable, get it out of the way".
+ */
+#define NVME_DETACH_TIMEOUT_SEC 10ULL
+
 static int
 nvme_detach_poller(void *arg)
 {
 	struct nvme_ctrlr *nvme_ctrlr = arg;
+	uint64_t elapsed;
 	int rc;
 
 	rc = spdk_nvme_detach_poll_async(nvme_ctrlr->detach_ctx);
-	if (rc != -EAGAIN) {
-		spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
-		_nvme_ctrlr_delete(nvme_ctrlr);
+	if (rc == -EAGAIN) {
+		elapsed = (spdk_get_ticks() - nvme_ctrlr->detach_start_tsc) / spdk_get_ticks_hz();
+		if (elapsed >= NVME_DETACH_TIMEOUT_SEC) {
+			NVME_CTRLR_ERRLOG(nvme_ctrlr,
+					  "spdk_nvme_detach_poll_async stuck >%" PRIu64 "s "
+					  "(qpair likely deactivating with no peer ack); "
+					  "force-completing controller delete\n",
+					  NVME_DETACH_TIMEOUT_SEC);
+			/* Drop the reference SPDK held for the in-flight detach. The
+			 * underlying NVMe library state will leak (some bytes per
+			 * controller) but the bdev_nvme layer won't deadlock callers
+			 * blocked on close. Acceptable trade-off — better than
+			 * permanently wedged consumers.
+			 */
+			spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
+			_nvme_ctrlr_delete(nvme_ctrlr);
+		}
+		return SPDK_POLLER_BUSY;
 	}
 
+	spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
+	_nvme_ctrlr_delete(nvme_ctrlr);
 	return SPDK_POLLER_BUSY;
 }
 
@@ -796,6 +827,7 @@ nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 
 	/* If we got here, the reset/detach poller cannot be active */
 	assert(nvme_ctrlr->reset_detach_poller == NULL);
+	nvme_ctrlr->detach_start_tsc = spdk_get_ticks();
 	nvme_ctrlr->reset_detach_poller = SPDK_POLLER_REGISTER(nvme_detach_poller,
 					  nvme_ctrlr, 1000);
 	if (nvme_ctrlr->reset_detach_poller == NULL) {

@@ -117,6 +117,17 @@ struct nvme_ctrlr {
 	/* Poller used to check for reset/detach completion */
 	struct spdk_poller			*reset_detach_poller;
 	struct spdk_nvme_detach_ctx		*detach_ctx;
+	/*
+	 * Tick at which the detach poller started polling
+	 * spdk_nvme_detach_poll_async. If detach doesn't complete within
+	 * NVME_DETACH_TIMEOUT_TICKS, the poller force-completes via
+	 * _nvme_ctrlr_delete instead of polling forever. Without this, a
+	 * qpair stuck in deactivating (peer dropped TCP without finishing
+	 * the disconnect handshake) leaves the controller in state="deleting"
+	 * forever and any consumer trying to close the bdev (raid teardown,
+	 * lvol close, etc.) hangs inside spdk_bdev_close.
+	 */
+	uint64_t				detach_start_tsc;
 
 	uint64_t				reset_start_tsc;
 	struct spdk_poller			*reconnect_delay_timer;
