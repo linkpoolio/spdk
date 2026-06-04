@@ -55,6 +55,9 @@ DEFINE_STUB_V(raid_bdev_queue_io_wait, (struct raid_bdev_io *raid_io, struct spd
 DEFINE_STUB(spdk_bdev_flush_blocks, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
 		void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_write_zeroes_blocks, int, (struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch, uint64_t offset_blocks, uint64_t num_blocks,
+		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB(spdk_bdev_is_dif_head_of_md, bool, (const struct spdk_bdev *bdev), false);
 DEFINE_STUB(spdk_bdev_notify_blockcnt_change, int, (struct spdk_bdev *bdev, uint64_t size), 0);
 
