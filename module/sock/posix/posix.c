@@ -2325,6 +2325,19 @@ _sock_group_impl_close(struct spdk_sock_group_impl *_group, uint32_t enable_plac
 	}
 
 	spdk_pipe_group_destroy(group->pipe_group);
+
+	/*
+	 * In interrupt mode group->fd is registered into the owning thread's
+	 * fd_group. Unregister it BEFORE close(): closing an fd automatically
+	 * removes it from the kernel epoll set, so closing first makes the later
+	 * EPOLL_CTL_DEL in spdk_fd_group_remove fail -- the teardown-ordering race
+	 * that aborts spdk_tgt during NVMe-oF/TCP qpair disconnects. The guard makes
+	 * this a no-op in poll mode and when the owner already unregistered.
+	 */
+	if (group->intr != NULL) {
+		spdk_interrupt_unregister(&group->intr);
+	}
+
 	rc = close(group->fd);
 	free(group);
 	return rc;
