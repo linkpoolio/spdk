@@ -481,10 +481,29 @@ spdk_fd_group_remove(struct spdk_fd_group *fgrp, int efd)
 
 	rc = epoll_ctl(root->epfd, EPOLL_CTL_DEL, ehdlr->fd, NULL);
 	if (rc < 0) {
-		SPDK_ERRLOG("Failed to remove fd: %d from fd group(%p): %s\n",
-			    ehdlr->fd, fgrp, strerror(errno));
-		assert(0);
-		return;
+		/*
+		 * EPOLL_CTL_DEL fails here when the fd is no longer in the kernel epoll
+		 * set -- almost always because the fd was already close()d (closing an fd
+		 * automatically removes it from any epoll set) before the handler was
+		 * unregistered. This is a teardown-ordering race observed with NVMe-oF/TCP
+		 * qpair disconnects in interrupt mode: the socket gets closed, then the
+		 * sock-group interrupt fd is unregistered.
+		 *
+		 * Previously this called assert(0) (aborting the entire spdk_tgt, taking
+		 * down every volume on the node) and returned WITHOUT unlinking the
+		 * handler -- leaving a stale handler in the list that the reactor could
+		 * never remove and would busy-spin on. Instead, log it and fall through
+		 * to complete the handler cleanup: the fd is already gone from epoll, so
+		 * dropping our bookkeeping is the correct way to finish the removal.
+		 */
+		if (errno == EBADF || errno == ENOENT) {
+			SPDK_WARNLOG("fd: %d already removed from epoll of fd group(%p): %s; "
+				     "completing handler cleanup\n", ehdlr->fd, fgrp, strerror(errno));
+		} else {
+			SPDK_ERRLOG("Failed to remove fd: %d from fd group(%p): %s; "
+				    "removing handler anyway to avoid a reactor busy-spin\n",
+				    ehdlr->fd, fgrp, strerror(errno));
+		}
 	}
 
 	assert(root->num_fds > 0);
