@@ -2029,8 +2029,17 @@ bdev_nvme_poll_adminq(void *arg)
 			 * and emit a NOTICE. Observed in production as ~231k
 			 * "Unable to perform failover, already in progress." lines in
 			 * ~15 min (~1.1 GB of log), saturating the SPDK reactor until
-			 * the liveness probe SIGKILLed spdk_tgt. Skipping the redundant
-			 * re-drive is safe: failover-while-resetting is a no-op anyway.
+			 * the liveness probe SIGKILLed spdk_tgt.
+			 *
+			 * Semantics delta vs the unguarded call: when a plain reset is
+			 * in flight (resetting set, in_failover clear), the unguarded
+			 * call took the -EINPROGRESS branch in
+			 * bdev_nvme_failover_ctrlr_unsafe and set pending_failover, so
+			 * a successful reset failed over immediately on completion.
+			 * With the guard, that failover happens one adminq poll later
+			 * (the admin qpair is still failed, so the next poll re-drives
+			 * it once resetting clears). Failed resets are unaffected:
+			 * bdev_nvme_reset_ctrlr_complete advances the trid itself.
 			 */
 			bdev_nvme_failover_ctrlr(nvme_ctrlr);
 		}
