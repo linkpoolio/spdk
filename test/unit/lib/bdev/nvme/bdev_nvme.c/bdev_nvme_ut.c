@@ -1838,6 +1838,100 @@ test_failover_ctrlr(void)
 	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
 }
 
+static void
+test_failover_not_redriven_while_resetting(void)
+{
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_ctrlr *nvme_ctrlr = NULL;
+	struct spdk_io_channel *ch1, *ch2;
+	int rc;
+
+	ut_init_trid(&trid);
+	TAILQ_INIT(&ctrlr.active_io_qpairs);
+
+	set_thread(0);
+
+	rc = nvme_ctrlr_create(&ctrlr, "nvme0", &trid, NULL);
+	CU_ASSERT(rc == 0);
+
+	nvme_ctrlr = nvme_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	ch1 = spdk_get_io_channel(nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	set_thread(1);
+
+	ch2 = spdk_get_io_channel(nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(ch2 != NULL);
+
+	set_thread(1);
+
+	/*
+	 * Case 1: a reset/failover is already in progress (resetting == true).
+	 * The admin queue is disconnected, so bdev_nvme_poll_adminq() sees
+	 * spdk_nvme_ctrlr_process_admin_completions() < 0 with no disconnected_cb
+	 * pending. It must NOT re-drive failover while resetting -- doing so spins
+	 * a no-op every poll, which in production logged ~231k "already in
+	 * progress" NOTICEs and saturated the reactor until liveness SIGKILLed
+	 * spdk_tgt. We observe the skip via pending_failover: an un-guarded
+	 * re-drive reaches bdev_nvme_failover_ctrlr_unsafe's "resetting &&
+	 * !in_failover" branch and sets pending_failover = true.
+	 */
+	nvme_ctrlr->resetting = true;
+	nvme_ctrlr->in_failover = false;
+	nvme_ctrlr->pending_failover = false;
+	nvme_ctrlr->disconnected_cb = NULL;
+	ctrlr.adminq.is_connected = false;
+
+	bdev_nvme_poll_adminq(nvme_ctrlr);
+
+	CU_ASSERT(nvme_ctrlr->pending_failover == false);
+	CU_ASSERT(nvme_ctrlr->resetting == true);
+
+	/* End the simulated in-flight reset before the next case. */
+	nvme_ctrlr->resetting = false;
+
+	/*
+	 * Case 2: no reset in progress. The same admin-queue failure MUST still
+	 * initiate failover, so the guard does not suppress legitimate recovery.
+	 * The controller transitions to resetting, and the reset reconnects and
+	 * completes on its own (reconnect_poll restores adminq connectivity).
+	 */
+	nvme_ctrlr->in_failover = false;
+	nvme_ctrlr->pending_failover = false;
+	nvme_ctrlr->disconnected_cb = NULL;
+	ctrlr.adminq.is_connected = false;
+
+	bdev_nvme_poll_adminq(nvme_ctrlr);
+
+	CU_ASSERT(nvme_ctrlr->resetting == true);
+
+	poll_threads();
+	spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr->resetting == false);
+
+	spdk_put_io_channel(ch2);
+
+	set_thread(0);
+
+	spdk_put_io_channel(ch1);
+
+	poll_threads();
+
+	rc = spdk_bdev_nvme_delete("nvme0", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
+}
+
 /* We had a bug when running test/nvmf/host/multipath.sh. The bug was the following.
  *
  * A nvme_ctrlr had trid1 and trid2 first. trid1 was active. A connection to trid1 was
@@ -8385,6 +8479,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reset_ctrlr);
 	CU_ADD_TEST(suite, test_race_between_reset_and_destruct_ctrlr);
 	CU_ADD_TEST(suite, test_failover_ctrlr);
+	CU_ADD_TEST(suite, test_failover_not_redriven_while_resetting);
 	CU_ADD_TEST(suite, test_race_between_failover_and_add_secondary_trid);
 	CU_ADD_TEST(suite, test_pending_reset);
 	CU_ADD_TEST(suite, test_attach_ctrlr);
