@@ -2015,7 +2015,23 @@ bdev_nvme_poll_adminq(void *arg)
 			bdev_nvme_change_adminq_poll_period(nvme_ctrlr,
 							    g_opts.nvme_adminq_poll_period_us);
 			disconnected_cb(nvme_ctrlr);
-		} else {
+		} else if (!nvme_ctrlr->resetting) {
+			/*
+			 * Only initiate failover when no reset/failover is already
+			 * in flight. While resetting is true the reset state machine
+			 * owns recovery (reconnect attempts, ctrlr_loss_timeout, and
+			 * advancing to the next trid on reset completion). Without
+			 * this guard, a stuck reconnect (e.g. a remote replica target
+			 * that accepts the TCP connection but never completes the
+			 * admin handshake) makes process_admin_completions return < 0
+			 * on every poll, and each poll re-calls bdev_nvme_failover_ctrlr
+			 * only to hit the "already in progress" path, return -EBUSY,
+			 * and emit a NOTICE. Observed in production as ~231k
+			 * "Unable to perform failover, already in progress." lines in
+			 * ~15 min (~1.1 GB of log), saturating the SPDK reactor until
+			 * the liveness probe SIGKILLed spdk_tgt. Skipping the redundant
+			 * re-drive is safe: failover-while-resetting is a no-op anyway.
+			 */
 			bdev_nvme_failover_ctrlr(nvme_ctrlr);
 		}
 	} else if (spdk_nvme_ctrlr_get_admin_qp_failure_reason(nvme_ctrlr->ctrlr) !=
