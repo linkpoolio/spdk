@@ -1081,6 +1081,11 @@ nvme_qpair_deinit(struct spdk_nvme_qpair *qpair)
 
 	assert(!qpair->fabric_poll_status);
 
+	/* The async-connect poller holds a raw pointer to this qpair; cancel it
+	 * before the memory is freed (see nvme_qpair_abort_async_connect).
+	 */
+	nvme_qpair_abort_async_connect(qpair);
+
 	nvme_qpair_abort_queued_reqs(qpair);
 	_nvme_qpair_complete_abort_queued_reqs(qpair);
 	nvme_qpair_complete_error_reqs(qpair);
