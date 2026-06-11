@@ -3305,14 +3305,21 @@ bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 
 	if (nvme_ctrlr->resetting) {
 		if (!nvme_ctrlr->in_failover) {
-			NVME_CTRLR_NOTICELOG(nvme_ctrlr,
-					     "Reset is already in progress. Defer failover until reset completes.\n");
+			/* Debug level: re-driven once per qpair disconnect event; under a
+			 * mass transport outage this fires at an unbounded rate across
+			 * every controller and a NOTICE here floods the log from the
+			 * reactor thread. The deferral itself is recorded in
+			 * pending_failover; state transitions still log at NOTICE.
+			 */
+			NVME_CTRLR_DEBUGLOG(nvme_ctrlr,
+					    "Reset is already in progress. Defer failover until reset completes.\n");
 
 			/* Defer failover until reset completes. */
 			nvme_ctrlr->pending_failover = true;
 			return -EINPROGRESS;
 		} else {
-			NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Unable to perform failover, already in progress.\n");
+			/* Debug level: see the deferral branch above. */
+			NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Unable to perform failover, already in progress.\n");
 			return -EBUSY;
 		}
 	}
@@ -3320,14 +3327,16 @@ bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	bdev_nvme_failover_trid(nvme_ctrlr, remove, true);
 
 	if (nvme_ctrlr->reconnect_is_delayed) {
-		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Reconnect is already scheduled.\n");
+		/* Debug level: see the deferral branch above. */
+		NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Reconnect is already scheduled.\n");
 
 		/* We rely on the next reconnect for the failover. */
 		return -EALREADY;
 	}
 
 	if (nvme_ctrlr->disabled) {
-		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Controller is disabled.\n");
+		/* Debug level: see the deferral branch above. */
+		NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Controller is disabled.\n");
 
 		/* We rely on the enablement for the failover. */
 		return -EALREADY;
