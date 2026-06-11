@@ -496,7 +496,7 @@ nvme_transport_connect_qpair_fail(struct spdk_nvme_qpair *qpair, void *unused)
 
 typedef void (*connect_complete_cb)(struct spdk_nvme_qpair *qpair, int status, void *cb_arg);
 
-struct connect_ctx {
+struct nvme_connect_ctx {
     struct spdk_nvme_qpair *qpair;
     struct spdk_nvme_poll_group *poll_group;
     struct spdk_poller *poller;
@@ -506,12 +506,35 @@ struct connect_ctx {
 };
 
 static void
-nvme_connect_complete(struct connect_ctx *ctx, int status)
+nvme_connect_complete(struct nvme_connect_ctx *ctx, int status)
 {
     if (ctx->cb_fn) {
         ctx->cb_fn(ctx->qpair, status, ctx->cb_arg);
     }
 
+    ctx->qpair->connect_ctx = NULL;
+    spdk_poller_unregister(&ctx->poller);
+    free(ctx);
+}
+
+/* Cancel an in-flight async connect before its qpair is freed. The connect
+ * poller holds a raw pointer to the qpair and ticks every 1 ms; a qpair can
+ * fail and be destroyed between ticks (mass reconnect storms do this
+ * constantly), after which the next tick dereferences freed memory --
+ * observed in production as a garbage-identifier flush error followed by a
+ * silent spdk_tgt crash. Destruction path: the completion callback is NOT
+ * invoked.
+ */
+void
+nvme_qpair_abort_async_connect(struct spdk_nvme_qpair *qpair)
+{
+    struct nvme_connect_ctx *ctx = qpair->connect_ctx;
+
+    if (ctx == NULL) {
+        return;
+    }
+
+    qpair->connect_ctx = NULL;
     spdk_poller_unregister(&ctx->poller);
     free(ctx);
 }
@@ -519,9 +542,23 @@ nvme_connect_complete(struct connect_ctx *ctx, int status)
 static int
 nvme_connect_poller(void *arg)
 {
-    struct connect_ctx *ctx = arg;
+    struct nvme_connect_ctx *ctx = arg;
     struct spdk_nvme_qpair *qpair = ctx->qpair;
+    enum nvme_qpair_state state;
     int rc;
+
+    /* Check the state before touching the transport: if the qpair already
+     * left CONNECTING (connected, or torn down by a failed reconnect),
+     * complete immediately rather than processing completions on it.
+     */
+    state = nvme_qpair_get_state(qpair);
+    if (state != NVME_QPAIR_CONNECTING) {
+        /* CONNECTED..ENABLED is success; DISCONNECTED/DISCONNECTING/DESTROYING
+         * means the connect attempt was torn down underneath us.
+         */
+        nvme_connect_complete(ctx, (state >= NVME_QPAIR_CONNECTED && state <= NVME_QPAIR_ENABLED) ? 0 : -ENXIO);
+        return SPDK_POLLER_BUSY;
+    }
 
     if (ctx->poll_group && spdk_nvme_ctrlr_is_fabrics(qpair->ctrlr)) {
         rc = spdk_nvme_poll_group_process_completions(ctx->poll_group, 0,
@@ -548,11 +585,16 @@ start_async_qpair_connect(struct spdk_nvme_qpair *qpair,
                           connect_complete_cb cb_fn,
                           void *cb_arg)
 {
-    struct connect_ctx *ctx;
+    struct nvme_connect_ctx *ctx;
 
     if (!qpair || !qpair->poll_group) {
         return -EINVAL;
     }
+
+    /* A reconnect can race a previous connect attempt whose poller has not
+     * completed yet; the new context supersedes it.
+     */
+    nvme_qpair_abort_async_connect(qpair);
 
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
@@ -569,6 +611,8 @@ start_async_qpair_connect(struct spdk_nvme_qpair *qpair,
         free(ctx);
         return -ENOMEM;
     }
+
+    qpair->connect_ctx = ctx;
 
     return 0;
 }
