@@ -4,6 +4,8 @@
  *   Copyright (c) 2021 Mellanox Technologies LTD. All rights reserved.
  */
 
+#include <sys/eventfd.h>
+
 #include "spdk_internal/cunit.h"
 
 #include "nvme/nvme_poll_group.c"
@@ -581,6 +583,57 @@ test_spdk_nvme_poll_group_get_free_stats(void)
 	CU_ASSERT(rc == -ENOTSUP);
 }
 
+
+/* A DISCONNECTING qpair's socket may already be closed when its fd is removed
+ * from an interrupt-mode poll group; the transport then cannot return the fd
+ * (-EINVAL) and this path used to assert fatal (production SIGABRT during a
+ * mass reconnect storm). The fd is now cached at registration and removal
+ * falls back to it; with neither available the removal is a quiet no-op.
+ */
+static void
+test_nvme_poll_group_remove_qpair_fd_closed_sock(void)
+{
+	struct spdk_nvme_poll_group *group;
+	struct spdk_nvme_transport_poll_group tgroup = {};
+	struct spdk_nvme_qpair qpair = {};
+	int efd;
+
+	group = spdk_nvme_poll_group_create(NULL, NULL);
+	SPDK_CU_ASSERT_FATAL(group != NULL);
+	group->enable_interrupts = true;
+	SPDK_CU_ASSERT_FATAL(spdk_fd_group_create(&group->fgrp) == 0);
+
+	tgroup.group = group;
+	qpair.poll_group = &tgroup;
+	qpair.fgrp_fd = -1;
+
+	/* Registration caches the fd. */
+	efd = eventfd(0, EFD_NONBLOCK);
+	SPDK_CU_ASSERT_FATAL(efd >= 0);
+	MOCK_SET(spdk_nvme_qpair_get_fd, efd);
+	CU_ASSERT(nvme_poll_group_add_qpair_fd(&qpair) == 0);
+	CU_ASSERT(qpair.fgrp_fd == efd);
+
+	/* Socket closes during teardown: the transport can no longer provide
+	 * the fd. Removal must use the cached fd and must not assert.
+	 */
+	MOCK_SET(spdk_nvme_qpair_get_fd, -EINVAL);
+	nvme_poll_group_remove_qpair_fd(&qpair);
+	CU_ASSERT(qpair.fgrp_fd == -1);
+	close(efd);
+
+	/* Nothing cached and no fd available: quiet no-op (this exact case was
+	 * the fatal assert).
+	 */
+	nvme_poll_group_remove_qpair_fd(&qpair);
+	CU_ASSERT(qpair.fgrp_fd == -1);
+
+	MOCK_CLEAR(spdk_nvme_qpair_get_fd);
+	spdk_fd_group_destroy(group->fgrp);
+	group->fgrp = NULL;
+	CU_ASSERT(spdk_nvme_poll_group_destroy(group) == 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -605,7 +658,9 @@ main(int argc, char **argv)
 			    test_spdk_nvme_poll_group_process_completions) == NULL ||
 		CU_add_test(suite, "nvme_poll_group_destroy_test", test_spdk_nvme_poll_group_destroy) == NULL ||
 		CU_add_test(suite, "nvme_poll_group_get_free_stats",
-			    test_spdk_nvme_poll_group_get_free_stats) == NULL
+			    test_spdk_nvme_poll_group_get_free_stats) == NULL ||
+		CU_add_test(suite, "nvme_poll_group_remove_qpair_fd_closed_sock",
+			    test_nvme_poll_group_remove_qpair_fd_closed_sock) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

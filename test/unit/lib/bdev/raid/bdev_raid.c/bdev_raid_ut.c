@@ -2072,6 +2072,31 @@ test_bdev_ioch_destroy(void *io_device, void *ctx_buf)
 {
 }
 
+
+/* When the base bdev is already gone (-ENODEV: removal already scheduled or
+ * base not configured), the fail path must NOT reset is_failed -- doing so
+ * let every subsequent IO error re-enter _raid_bdev_fail_base_bdev and retry
+ * the removal forever (observed as a sub-millisecond livelock during a
+ * reconnect storm). Genuine transient failures still reset it.
+ */
+static void
+test_raid_fail_base_remove_enodev_keeps_failed(void)
+{
+	struct raid_base_bdev_info base_info = {};
+
+	base_info.is_failed = true;
+	raid_bdev_fail_base_remove_cb(&base_info, -ENODEV);
+	CU_ASSERT(base_info.is_failed == true);
+
+	base_info.is_failed = true;
+	raid_bdev_fail_base_remove_cb(&base_info, -EBUSY);
+	CU_ASSERT(base_info.is_failed == false);
+
+	base_info.is_failed = true;
+	raid_bdev_fail_base_remove_cb(&base_info, 0);
+	CU_ASSERT(base_info.is_failed == true);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2099,6 +2124,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev_not_supported);
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev);
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev_with_hole);
+	CU_ADD_TEST(suite, test_raid_fail_base_remove_enodev_keeps_failed);
 
 	spdk_thread_lib_init(test_new_thread_fn, 0);
 	g_app_thread = spdk_thread_create("app_thread", NULL);

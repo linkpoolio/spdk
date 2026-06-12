@@ -2822,6 +2822,16 @@ raid_bdev_fail_base_remove_cb(void *ctx, int status)
 {
 	struct raid_base_bdev_info *base_info = ctx;
 
+	if (status == -ENODEV) {
+		/* The base bdev is already gone -- removal reached its goal state.
+		 * Resetting is_failed here would let every subsequent IO error
+		 * re-enter the fail path and retry the removal forever (observed
+		 * as a sub-millisecond ERROR/NOTICE livelock during a reconnect
+		 * storm); keep the base marked failed instead.
+		 */
+		return;
+	}
+
 	if (status != 0) {
 		SPDK_WARNLOG("Failed to remove base bdev %s\n", base_info->name);
 		base_info->is_failed = false;

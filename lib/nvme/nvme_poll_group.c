@@ -273,7 +273,7 @@ nvme_poll_group_add_qpair_fd(struct spdk_nvme_qpair *qpair)
 	struct spdk_event_handler_opts opts = {
 		.opts_size = SPDK_SIZEOF(&opts, fd_type),
 	};
-	int fd;
+	int fd, rc;
 
 	group = qpair->poll_group->group;
 	if (group->enable_interrupts == false) {
@@ -286,8 +286,16 @@ nvme_poll_group_add_qpair_fd(struct spdk_nvme_qpair *qpair)
 		return -EINVAL;
 	}
 
-	return SPDK_FD_GROUP_ADD_EXT(group->fgrp, fd, nvme_qpair_process_completion_wrapper,
-				     qpair, &opts);
+	rc = SPDK_FD_GROUP_ADD_EXT(group->fgrp, fd, nvme_qpair_process_completion_wrapper,
+				   qpair, &opts);
+	if (rc == 0) {
+		/* Cache for removal: by then the socket may already be closed and
+		 * the fd unobtainable from the transport.
+		 */
+		qpair->fgrp_fd = fd;
+	}
+
+	return rc;
 }
 
 static void
@@ -301,14 +309,25 @@ nvme_poll_group_remove_qpair_fd(struct spdk_nvme_qpair *qpair)
 		return;
 	}
 
-	fd = spdk_nvme_qpair_get_fd(qpair, NULL);
+	/* Use the fd cached at registration: during a DISCONNECTING teardown
+	 * the socket may already be closed and the transport cannot return the
+	 * fd any more -- previously this path asserted fatal in exactly that
+	 * situation (mass reconnect storm). spdk_fd_group_remove tolerates an
+	 * fd that the kernel already dropped from epoll on close and still
+	 * completes the handler-table cleanup.
+	 */
+	fd = qpair->fgrp_fd;
 	if (fd < 0) {
-		NVME_QPAIR_ERRLOG(qpair, "Cannot get fd for the qpair: %d\n", fd);
-		assert(false);
+		fd = spdk_nvme_qpair_get_fd(qpair, NULL);
+	}
+	if (fd < 0) {
+		NVME_QPAIR_DEBUGLOG(qpair,
+				    "No fd to remove for the qpair (socket already closed and none cached)\n");
 		return;
 	}
 
 	spdk_fd_group_remove(group->fgrp, fd);
+	qpair->fgrp_fd = -1;
 }
 
 int

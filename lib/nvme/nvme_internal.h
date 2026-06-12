@@ -541,6 +541,15 @@ struct spdk_nvme_qpair {
 	 */
 	struct nvme_connect_ctx			*connect_ctx;
 
+	/* The fd registered with the poll group's fd group while this qpair is
+	 * in an interrupt-mode poll group, else -1. Cached at registration so
+	 * removal does not have to re-query the transport: a DISCONNECTING
+	 * qpair's socket may already be closed, in which case the fd cannot be
+	 * fetched any more (observed as a fatal assert during a mass reconnect
+	 * storm).
+	 */
+	int					fgrp_fd;
+
 	/* List entry for spdk_nvme_ctrlr::active_io_qpairs */
 	TAILQ_ENTRY(spdk_nvme_qpair)		tailq;
 
