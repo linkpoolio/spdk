@@ -130,6 +130,10 @@ struct nvme_ctrlr {
 	uint64_t				detach_start_tsc;
 
 	uint64_t				reset_start_tsc;
+	/* Tick of the last adminq-poller failover re-drive, used to rate-limit
+	 * re-drives to ~1 Hz against a permanently-failing (downed) target.
+	 * Cleared on a successful reset. See bdev_nvme_poll_adminq. */
+	uint64_t				failover_redrive_tsc;
 	struct spdk_poller			*reconnect_delay_timer;
 
 	nvme_ctrlr_disconnected_cb		disconnected_cb;
