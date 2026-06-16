@@ -460,9 +460,27 @@ nvme_bdev_ctrlr_get_bdev(struct nvme_bdev_ctrlr *nbdev_ctrlr, uint32_t nsid)
 	assert(spdk_thread_is_app_thread(NULL));
 
 	TAILQ_FOREACH(nbdev, &nbdev_ctrlr->bdevs, tailq) {
-		if (nbdev->nsid == nsid) {
-			break;
+		if (nbdev->nsid != nsid) {
+			continue;
 		}
+		/* Skip any instance that is being torn down. Its last namespace has
+		 * already depopulated (ref == 0) and/or spdk_bdev_unregister() is in
+		 * flight (disk status != READY). Such an instance can linger on this
+		 * list with its name storage already freed when its destruct is
+		 * deferred indefinitely (an open descriptor while a reset against a
+		 * downed target never completes). Handing it back to
+		 * nvme_ctrlr_populate_namespace() on reconnect would resurrect a
+		 * half-freed object (use-after-free) and collide on the freed name;
+		 * the caller creates a fresh bdev instead. The dying instance is
+		 * removed from this list by bdev_nvme_destruct() once its destruct
+		 * finally runs.
+		 */
+		if (nbdev->ref == 0 ||
+		    nbdev->disk.internal.status == SPDK_BDEV_STATUS_REMOVING ||
+		    nbdev->disk.internal.status == SPDK_BDEV_STATUS_UNREGISTERING) {
+			continue;
+		}
+		break;
 	}
 
 	return nbdev;
@@ -2309,6 +2327,19 @@ static void
 bdev_nvme_reset_ctrlr_complete_failed(void *ctx)
 {
 	struct nvme_ctrlr *nvme_ctrlr = ctx;
+
+	/* This is the deferred failure arm of nvme_ctrlr_disconnect(): the reset
+	 * sequence that issued the disconnect is still in flight, so resetting is
+	 * set. Make the deferred completion single-shot/idempotent: if resetting
+	 * has already been cleared (the sequence completed by some other path
+	 * between this send_msg and its delivery, or a duplicate message), do
+	 * nothing. bdev_nvme_reset_ctrlr_complete() must not run twice for one
+	 * reset -- doing so would clear a freshly-started reset's state, double
+	 * flush pending resets, and re-drive failover spuriously.
+	 */
+	if (!nvme_ctrlr->resetting) {
+		return;
+	}
 
 	bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
 }
