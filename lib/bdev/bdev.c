@@ -10191,7 +10191,6 @@ static void
 bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 {
 	struct spdk_bdev *bdev;
-	int rc;
 
 	spdk_spin_lock(&ctx->bdev->internal.spinlock);
 	ctx->bdev->internal.qos_mod_in_progress = false;
@@ -10203,21 +10202,7 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 	bdev = ctx->bdev;
 	free(ctx);
 
-	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	spdk_spin_lock(&bdev->internal.spinlock);
-	if (bdev->internal.status == SPDK_BDEV_STATUS_REMOVING && TAILQ_EMPTY(&bdev->internal.open_descs)) {
-		SPDK_DEBUGLOG(bdev, "Data race detected - trying to enable QoS on unregistered bdev %s",
-			      bdev->name);
-		rc = bdev_unregister_unsafe(bdev);
-		spdk_spin_unlock(&bdev->internal.spinlock);
-
-		if (rc == 0) {
-			spdk_io_device_unregister(__bdev_to_io_dev(bdev), bdev_destroy_cb);
-		}
-	} else {
-		spdk_spin_unlock(&bdev->internal.spinlock);
-	}
-	spdk_spin_unlock(&g_bdev_mgr.spinlock);
+	bdev_unregister_if_ready(bdev);
 }
 
 static void

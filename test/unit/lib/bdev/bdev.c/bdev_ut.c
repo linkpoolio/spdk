@@ -4614,6 +4614,46 @@ bdev_unregister_waits_for_reset_and_qos(void)
 }
 
 static void
+bdev_last_close_completes_deferred_unregister(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	int rc;
+
+	bdev = allocate_bdev("bdev");
+
+	rc = spdk_bdev_open_ext("bdev", false, bdev_ut_event_cb, NULL, &desc);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+
+	g_unregister_arg = NULL;
+	g_unregister_rc = -1;
+
+	spdk_bdev_unregister(bdev, bdev_unregister_cb, (void *)0x12345678);
+	poll_threads();
+
+	CU_ASSERT(bdev->internal.status == SPDK_BDEV_STATUS_REMOVING);
+	CU_ASSERT(spdk_bdev_get_by_name("bdev") == bdev);
+	CU_ASSERT(g_unregister_arg == NULL);
+	CU_ASSERT(g_unregister_rc == -1);
+
+	/*
+	 * The final close of a REMOVING bdev completes the deferred unregister.
+	 * This path must hold g_bdev_mgr.spinlock before mutating the global bdev
+	 * list/name tree through bdev_unregister_unsafe().
+	 */
+	spdk_bdev_close(desc);
+	poll_threads();
+
+	CU_ASSERT(spdk_bdev_get_by_name("bdev") == NULL);
+	CU_ASSERT(g_unregister_arg == (void *)0x12345678);
+	CU_ASSERT(g_unregister_rc == 0);
+
+	memset(bdev, 0xFF, sizeof(*bdev));
+	free(bdev);
+}
+
+static void
 bdev_open_ext_test(void)
 {
 	struct spdk_bdev *bdev;
@@ -8449,6 +8489,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_open_while_hotremove);
 	CU_ADD_TEST(suite, bdev_close_while_hotremove);
 	CU_ADD_TEST(suite, bdev_unregister_waits_for_reset_and_qos);
+	CU_ADD_TEST(suite, bdev_last_close_completes_deferred_unregister);
 	CU_ADD_TEST(suite, bdev_open_ext_test);
 	CU_ADD_TEST(suite, bdev_open_ext_unregister);
 	CU_ADD_TEST(suite, bdev_set_io_timeout);
