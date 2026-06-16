@@ -8026,6 +8026,46 @@ bdev_io_complete_unsubmitted(struct spdk_bdev_io *bdev_io)
 static void bdev_destroy_cb(void *io_device);
 static int bdev_unregister_unsafe(struct spdk_bdev *bdev);
 
+static bool
+bdev_list_remove_unsafe(struct spdk_bdev *bdev)
+{
+	struct spdk_bdev *iter, *prev = NULL, *next;
+
+	assert(spdk_spin_held(&g_bdev_mgr.spinlock));
+
+	for (iter = TAILQ_FIRST(&g_bdev_mgr.bdevs); iter != NULL;
+	     prev = iter, iter = TAILQ_NEXT(iter, internal.link)) {
+		if (iter != bdev) {
+			continue;
+		}
+
+		next = TAILQ_NEXT(iter, internal.link);
+		if (prev != NULL) {
+			prev->internal.link.tqe_next = next;
+		} else {
+			g_bdev_mgr.bdevs.tqh_first = next;
+		}
+
+		if (next != NULL) {
+			next->internal.link.tqe_prev = prev != NULL ?
+						      &prev->internal.link.tqe_next :
+						      &g_bdev_mgr.bdevs.tqh_first;
+		} else {
+			g_bdev_mgr.bdevs.tqh_last = prev != NULL ?
+						    &prev->internal.link.tqe_next :
+						    &g_bdev_mgr.bdevs.tqh_first;
+		}
+
+		bdev->internal.link.tqe_next = NULL;
+		bdev->internal.link.tqe_prev = NULL;
+		return true;
+	}
+
+	SPDK_ERRLOG("Bdev %p (%s) is missing from the global bdev list\n",
+		    bdev, bdev->name);
+	return false;
+}
+
 static void
 bdev_unregister_if_ready(struct spdk_bdev *bdev)
 {
@@ -8681,7 +8721,10 @@ bdev_unregister_unsafe(struct spdk_bdev *bdev)
 			bdev_examine_allowlist_remove(alias->alias.name);
 		}
 		bdev_alias_del_all(bdev, bdev_name_del_unsafe);
-		TAILQ_REMOVE(&g_bdev_mgr.bdevs, bdev, internal.link);
+		if (!bdev_list_remove_unsafe(bdev)) {
+			rc = -EIO;
+			return rc;
+		}
 		SPDK_DEBUGLOG(bdev, "Removing bdev %s from list done\n", bdev->name);
 
 		/* Delete the name */
@@ -8909,7 +8952,8 @@ bdev_open(struct spdk_bdev *bdev, bool write, struct spdk_bdev_desc *desc)
 	desc->write = write;
 
 	spdk_spin_lock(&bdev->internal.spinlock);
-	if (bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
+	if (bdev->internal.status == SPDK_BDEV_STATUS_INVALID ||
+	    bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
 	    bdev->internal.status == SPDK_BDEV_STATUS_REMOVING) {
 		spdk_spin_unlock(&bdev->internal.spinlock);
 		return -ENODEV;
@@ -9882,6 +9926,47 @@ spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
 	return desc->bdev;
 }
 
+static bool
+bdev_list_link_valid_unsafe(struct spdk_bdev *cur, struct spdk_bdev *prev)
+{
+	struct spdk_bdev *iter, *last;
+	struct spdk_bdev **expected_prev;
+
+	assert(spdk_spin_held(&g_bdev_mgr.spinlock));
+
+	last = prev;
+	iter = prev != NULL ? TAILQ_NEXT(prev, internal.link) : TAILQ_FIRST(&g_bdev_mgr.bdevs);
+	while (iter != NULL) {
+		expected_prev = last != NULL ? &last->internal.link.tqe_next :
+				&g_bdev_mgr.bdevs.tqh_first;
+		if (iter->internal.link.tqe_prev != expected_prev) {
+			SPDK_ERRLOG("Stopping bdev iteration at stale list edge prev=%p cur=%p\n",
+				    last, iter);
+			return false;
+		}
+		if (iter == cur) {
+			break;
+		}
+		last = iter;
+		iter = TAILQ_NEXT(iter, internal.link);
+	}
+
+	if (iter != cur) {
+		SPDK_ERRLOG("Stopping bdev iteration at unreachable list entry prev=%p cur=%p\n",
+			    prev, cur);
+		return false;
+	}
+
+	if (!cur->internal.spinlock.initialized || cur->internal.spinlock.destroyed ||
+	    cur->internal.status == SPDK_BDEV_STATUS_INVALID) {
+		SPDK_ERRLOG("Stopping bdev iteration at invalid bdev entry cur=%p status=%d\n",
+			    cur, cur->internal.status);
+		return false;
+	}
+
+	return true;
+}
+
 /*
  * Open a descriptor (a "pin") on the first bdev at or after *bdev that can be
  * opened, walking the list with next_fn().  Must be called with
@@ -9909,6 +9994,10 @@ bdev_pin_next(struct spdk_bdev **bdev, struct spdk_bdev_desc **desc,
 	assert(spdk_spin_held(&g_bdev_mgr.spinlock));
 
 	while (cur != NULL) {
+		if (!bdev_list_link_valid_unsafe(cur, prev)) {
+			*bdev = NULL;
+			return 0;
+		}
 		rc = bdev_desc_alloc(cur, _tmp_bdev_event_cb, NULL, NULL, &d);
 		if (rc != 0) {
 			*bdev = NULL;

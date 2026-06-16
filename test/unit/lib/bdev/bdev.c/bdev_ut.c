@@ -4653,6 +4653,45 @@ bdev_last_close_completes_deferred_unregister(void)
 	free(bdev);
 }
 
+static int count_bdevs(void *ctx, struct spdk_bdev *bdev);
+
+static void
+bdev_unregister_repairs_corrupt_list_back_pointer(void)
+{
+	struct spdk_bdev *bdev[3];
+	int rc, count;
+
+	bdev[0] = allocate_bdev("bdev0");
+	bdev[1] = allocate_bdev("bdev1");
+	bdev[2] = allocate_bdev("bdev2");
+
+	/*
+	 * Production cores showed a valid bdev whose next pointer led to a
+	 * freed/invalid bdev with a cleared back-pointer.  Do not trust the
+	 * removed bdev's embedded tqe_prev when unlinking from the global list.
+	 */
+	bdev[1]->internal.link.tqe_prev = NULL;
+
+	g_unregister_arg = NULL;
+	g_unregister_rc = -1;
+
+	spdk_bdev_unregister(bdev[1], bdev_unregister_cb, (void *)0x12345678);
+	poll_threads();
+
+	CU_ASSERT(spdk_bdev_get_by_name("bdev1") == NULL);
+	CU_ASSERT(g_unregister_arg == (void *)0x12345678);
+	CU_ASSERT(g_unregister_rc == 0);
+
+	count = 0;
+	rc = spdk_for_each_bdev(&count, count_bdevs);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(count == 2);
+
+	free_bdev(bdev[0]);
+	free_bdev(bdev[1]);
+	free_bdev(bdev[2]);
+}
+
 static void
 bdev_open_ext_test(void)
 {
@@ -8490,6 +8529,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_close_while_hotremove);
 	CU_ADD_TEST(suite, bdev_unregister_waits_for_reset_and_qos);
 	CU_ADD_TEST(suite, bdev_last_close_completes_deferred_unregister);
+	CU_ADD_TEST(suite, bdev_unregister_repairs_corrupt_list_back_pointer);
 	CU_ADD_TEST(suite, bdev_open_ext_test);
 	CU_ADD_TEST(suite, bdev_open_ext_unregister);
 	CU_ADD_TEST(suite, bdev_set_io_timeout);
