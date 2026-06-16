@@ -8721,14 +8721,21 @@ bdev_unregister_unsafe(struct spdk_bdev *bdev)
 			bdev_examine_allowlist_remove(alias->alias.name);
 		}
 		bdev_alias_del_all(bdev, bdev_name_del_unsafe);
-		if (!bdev_list_remove_unsafe(bdev)) {
-			rc = -EIO;
-			return rc;
-		}
-		SPDK_DEBUGLOG(bdev, "Removing bdev %s from list done\n", bdev->name);
 
-		/* Delete the name */
+		/*
+		 * Delete the name before unlinking from the global list.  If the
+		 * list entry was already removed or the list is corrupt, the bdev
+		 * must still stop being discoverable by name; otherwise a later
+		 * RB_FIND() can walk a stale name entry after this bdev is freed.
+		 */
 		bdev_name_del_unsafe(&bdev->internal.bdev_name);
+
+		if (!bdev_list_remove_unsafe(bdev)) {
+			SPDK_ERRLOG("Continuing unregister for bdev %p (%s) with missing list entry\n",
+				    bdev, bdev->name);
+		} else {
+			SPDK_DEBUGLOG(bdev, "Removing bdev %s from list done\n", bdev->name);
+		}
 
 		spdk_notify_send("bdev_unregister", spdk_bdev_get_name(bdev));
 		bdev->internal.status = SPDK_BDEV_STATUS_INVALID;

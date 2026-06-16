@@ -4693,6 +4693,49 @@ bdev_unregister_repairs_corrupt_list_back_pointer(void)
 }
 
 static void
+bdev_unregister_deletes_name_when_list_entry_missing(void)
+{
+	struct spdk_bdev *bdev[3];
+	int rc, count;
+
+	bdev[0] = allocate_bdev("bdev0");
+	bdev[1] = allocate_bdev("bdev1");
+	bdev[2] = allocate_bdev("bdev2");
+
+	/*
+	 * Simulate an earlier unlink that removed the bdev from the list but
+	 * left the name tree entry behind.  Unregister must still delete the
+	 * name so bdev_get_by_name() cannot later dereference stale RB-tree
+	 * contents after the bdev is destructed.
+	 */
+	TAILQ_REMOVE(&g_bdev_mgr.bdevs, bdev[1], internal.link);
+	bdev[1]->internal.link.tqe_next = NULL;
+	bdev[1]->internal.link.tqe_prev = NULL;
+
+	CU_ASSERT(spdk_bdev_get_by_name("bdev1") == bdev[1]);
+
+	g_unregister_arg = NULL;
+	g_unregister_rc = -1;
+
+	spdk_bdev_unregister(bdev[1], bdev_unregister_cb, (void *)0x12345678);
+	poll_threads();
+
+	CU_ASSERT(spdk_bdev_get_by_name("bdev1") == NULL);
+	CU_ASSERT(g_unregister_arg == (void *)0x12345678);
+	CU_ASSERT(g_unregister_rc == 0);
+
+	count = 0;
+	rc = spdk_for_each_bdev(&count, count_bdevs);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(count == 2);
+
+	free_bdev(bdev[0]);
+	memset(bdev[1], 0xFF, sizeof(*bdev[1]));
+	free(bdev[1]);
+	free_bdev(bdev[2]);
+}
+
+static void
 bdev_open_ext_test(void)
 {
 	struct spdk_bdev *bdev;
@@ -8530,6 +8573,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_unregister_waits_for_reset_and_qos);
 	CU_ADD_TEST(suite, bdev_last_close_completes_deferred_unregister);
 	CU_ADD_TEST(suite, bdev_unregister_repairs_corrupt_list_back_pointer);
+	CU_ADD_TEST(suite, bdev_unregister_deletes_name_when_list_entry_missing);
 	CU_ADD_TEST(suite, bdev_open_ext_test);
 	CU_ADD_TEST(suite, bdev_open_ext_unregister);
 	CU_ADD_TEST(suite, bdev_set_io_timeout);
