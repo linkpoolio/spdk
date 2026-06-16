@@ -4573,6 +4573,47 @@ bdev_close_while_hotremove(void)
 }
 
 static void
+bdev_unregister_waits_for_reset_and_qos(void)
+{
+	struct spdk_bdev *bdev;
+
+	bdev = allocate_bdev("bdev");
+	bdev->internal.qos_mod_in_progress = true;
+	bdev->internal.reset_in_progress = (struct spdk_bdev_io *)0x1;
+
+	g_unregister_arg = NULL;
+	g_unregister_rc = -1;
+
+	spdk_bdev_unregister(bdev, bdev_unregister_cb, (void *)0x12345678);
+	poll_threads();
+
+	CU_ASSERT(bdev->internal.status == SPDK_BDEV_STATUS_REMOVING);
+	CU_ASSERT(spdk_bdev_get_by_name("bdev") == bdev);
+	CU_ASSERT(g_unregister_arg == NULL);
+	CU_ASSERT(g_unregister_rc == -1);
+
+	bdev->internal.reset_in_progress = NULL;
+	bdev_unregister_if_ready(bdev);
+	poll_threads();
+
+	CU_ASSERT(bdev->internal.status == SPDK_BDEV_STATUS_REMOVING);
+	CU_ASSERT(spdk_bdev_get_by_name("bdev") == bdev);
+	CU_ASSERT(g_unregister_arg == NULL);
+	CU_ASSERT(g_unregister_rc == -1);
+
+	bdev->internal.qos_mod_in_progress = false;
+	bdev_unregister_if_ready(bdev);
+	poll_threads();
+
+	CU_ASSERT(spdk_bdev_get_by_name("bdev") == NULL);
+	CU_ASSERT(g_unregister_arg == (void *)0x12345678);
+	CU_ASSERT(g_unregister_rc == 0);
+
+	memset(bdev, 0xFF, sizeof(*bdev));
+	free(bdev);
+}
+
+static void
 bdev_open_ext_test(void)
 {
 	struct spdk_bdev *bdev;
@@ -8407,6 +8448,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_zcopy_read);
 	CU_ADD_TEST(suite, bdev_open_while_hotremove);
 	CU_ADD_TEST(suite, bdev_close_while_hotremove);
+	CU_ADD_TEST(suite, bdev_unregister_waits_for_reset_and_qos);
 	CU_ADD_TEST(suite, bdev_open_ext_test);
 	CU_ADD_TEST(suite, bdev_open_ext_unregister);
 	CU_ADD_TEST(suite, bdev_set_io_timeout);

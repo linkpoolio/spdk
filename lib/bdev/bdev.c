@@ -85,6 +85,14 @@ RB_HEAD(bdev_name_tree, spdk_bdev_name);
 static int
 bdev_name_cmp(struct spdk_bdev_name *name1, struct spdk_bdev_name *name2)
 {
+	if (spdk_unlikely(name1->name == NULL || name2->name == NULL)) {
+		if (name1->name == name2->name) {
+			return 0;
+		}
+
+		return name1->name == NULL ? -1 : 1;
+	}
+
 	return strcmp(name1->name, name2->name);
 }
 
@@ -5059,19 +5067,43 @@ bdev_name_add(struct spdk_bdev_name *bdev_name, struct spdk_bdev *bdev, const ch
 	return 0;
 }
 
-static void
+static bool
 bdev_name_del_unsafe(struct spdk_bdev_name *bdev_name)
 {
-	RB_REMOVE(bdev_name_tree, &g_bdev_mgr.bdev_names, bdev_name);
+	struct spdk_bdev_name *removed;
+
+	if (bdev_name->name == NULL) {
+		SPDK_ERRLOG("Bdev name entry %p is already deleted\n", bdev_name);
+		return false;
+	}
+
+	removed = RB_REMOVE(bdev_name_tree, &g_bdev_mgr.bdev_names, bdev_name);
+	if (removed != bdev_name) {
+		SPDK_ERRLOG("Bdev name entry %p (%s) is missing from the name tree\n",
+			    bdev_name, bdev_name->name);
+		return false;
+	}
+
 	free(bdev_name->name);
+	bdev_name->name = NULL;
+	bdev_name->bdev = NULL;
+	bdev_name->node.rbe_left = NULL;
+	bdev_name->node.rbe_right = NULL;
+	bdev_name->node.rbe_parent = NULL;
+
+	return true;
 }
 
-static void
+static bool
 bdev_name_del(struct spdk_bdev_name *bdev_name)
 {
+	bool deleted;
+
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	bdev_name_del_unsafe(bdev_name);
+	deleted = bdev_name_del_unsafe(bdev_name);
 	spdk_spin_unlock(&g_bdev_mgr.spinlock);
+
+	return deleted;
 }
 
 int
@@ -5104,15 +5136,16 @@ spdk_bdev_alias_add(struct spdk_bdev *bdev, const char *alias)
 
 static int
 bdev_alias_del(struct spdk_bdev *bdev, const char *alias,
-	       void (*alias_del_fn)(struct spdk_bdev_name *n))
+	       bool (*alias_del_fn)(struct spdk_bdev_name *n))
 {
 	struct spdk_bdev_alias *tmp;
 
 	TAILQ_FOREACH(tmp, &bdev->aliases, tailq) {
 		if (strcmp(alias, tmp->alias.name) == 0) {
 			TAILQ_REMOVE(&bdev->aliases, tmp, tailq);
-			alias_del_fn(&tmp->alias);
-			free(tmp);
+			if (alias_del_fn(&tmp->alias)) {
+				free(tmp);
+			}
 			return 0;
 		}
 	}
@@ -5134,14 +5167,15 @@ spdk_bdev_alias_del(struct spdk_bdev *bdev, const char *alias)
 }
 
 static void
-bdev_alias_del_all(struct spdk_bdev *bdev, void (*alias_del_fn)(struct spdk_bdev_name *n))
+bdev_alias_del_all(struct spdk_bdev *bdev, bool (*alias_del_fn)(struct spdk_bdev_name *n))
 {
 	struct spdk_bdev_alias *p, *tmp;
 
 	TAILQ_FOREACH_SAFE(p, &bdev->aliases, tailq, tmp) {
 		TAILQ_REMOVE(&bdev->aliases, p, tailq);
-		alias_del_fn(&p->alias);
-		free(p);
+		if (alias_del_fn(&p->alias)) {
+			free(p);
+		}
 	}
 }
 
@@ -7990,6 +8024,26 @@ bdev_io_complete_unsubmitted(struct spdk_bdev_io *bdev_io)
 }
 
 static void bdev_destroy_cb(void *io_device);
+static int bdev_unregister_unsafe(struct spdk_bdev *bdev);
+
+static void
+bdev_unregister_if_ready(struct spdk_bdev *bdev)
+{
+	int rc = -EBUSY;
+
+	spdk_spin_lock(&g_bdev_mgr.spinlock);
+	spdk_spin_lock(&bdev->internal.spinlock);
+	if (bdev->internal.status == SPDK_BDEV_STATUS_REMOVING &&
+	    TAILQ_EMPTY(&bdev->internal.open_descs)) {
+		rc = bdev_unregister_unsafe(bdev);
+	}
+	spdk_spin_unlock(&bdev->internal.spinlock);
+	spdk_spin_unlock(&g_bdev_mgr.spinlock);
+
+	if (rc == 0) {
+		spdk_io_device_unregister(__bdev_to_io_dev(bdev), bdev_destroy_cb);
+	}
+}
 
 static inline void
 _bdev_reset_complete(void *ctx)
@@ -8031,10 +8085,7 @@ bdev_reset_complete(struct spdk_bdev *bdev, void *_ctx, int status)
 
 	_bdev_reset_complete(bdev_io);
 
-	if (bdev->internal.status == SPDK_BDEV_STATUS_REMOVING &&
-	    TAILQ_EMPTY(&bdev->internal.open_descs)) {
-		spdk_io_device_unregister(__bdev_to_io_dev(bdev), bdev_destroy_cb);
-	}
+	bdev_unregister_if_ready(bdev);
 }
 
 static void
@@ -8618,6 +8669,11 @@ bdev_unregister_unsafe(struct spdk_bdev *bdev)
 		rc = -EBUSY;
 	}
 
+	if (bdev->internal.reset_in_progress != NULL) {
+		/* Reset completion will continue unregister once it clears reset_in_progress. */
+		rc = -EBUSY;
+	}
+
 	/* If there are no descriptors, proceed removing the bdev */
 	if (rc == 0) {
 		bdev_examine_allowlist_remove(bdev->name);
@@ -8632,13 +8688,7 @@ bdev_unregister_unsafe(struct spdk_bdev *bdev)
 		bdev_name_del_unsafe(&bdev->internal.bdev_name);
 
 		spdk_notify_send("bdev_unregister", spdk_bdev_get_name(bdev));
-
-		if (bdev->internal.reset_in_progress != NULL) {
-			/* If reset is in progress, let the completion callback for reset
-			 * unregister the bdev.
-			 */
-			rc = -EBUSY;
-		}
+		bdev->internal.status = SPDK_BDEV_STATUS_INVALID;
 	}
 
 	return rc;
@@ -8718,7 +8768,8 @@ spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void
 	}
 
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	if (bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
+	if (bdev->internal.status == SPDK_BDEV_STATUS_INVALID ||
+	    bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
 	    bdev->internal.status == SPDK_BDEV_STATUS_REMOVING) {
 		spdk_spin_unlock(&g_bdev_mgr.spinlock);
 		if (cb_fn) {
