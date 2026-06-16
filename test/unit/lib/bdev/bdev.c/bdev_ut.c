@@ -6572,6 +6572,179 @@ count_bdevs(void *ctx, struct spdk_bdev *bdev)
 	return 0;
 }
 
+/*
+ * Reproducer for the iterate-during-unregister use-after-free.
+ *
+ * spdk_for_each_bdev() drops g_bdev_mgr.spinlock around the user callback.
+ * Historically only the *current* bdev was pinned with a descriptor across
+ * that window; the *next* bdev (which the iterator was about to open) was not.
+ * A concurrent teardown (e.g. an nvme bdev being unregistered under a
+ * reconnect storm) could therefore destruct and free the next bdev's struct
+ * while the iterator held no reference to it, and the iterator would then call
+ * bdev_open() on freed memory -> SIGABRT in spdk_spin_lock() / heap UAF.
+ *
+ * This freeing destruct mirrors the nvme bdev, whose struct memory is freed as
+ * part of unregister teardown (the test harness's normal stub_destruct does
+ * not free the struct, so it cannot exercise the UAF).
+ */
+/*
+ * The vbdev_ut examine module interprets bdev->ctxt as a struct ut_examine_ctx,
+ * so we wrap our self-freeing bdev in one (zeroed -> examine is a safe no-op)
+ * and stash a back-pointer to the bdev for the destruct to free.
+ */
+struct freeing_bdev_ctx {
+	struct ut_examine_ctx	examine;	/* must be first - read by vbdev_ut examine */
+	struct spdk_bdev	*bdev;
+};
+
+static int
+freeing_destruct(void *_ctx)
+{
+	struct freeing_bdev_ctx *ctx = _ctx;
+	struct spdk_bdev *bdev = ctx->bdev;
+
+	/*
+	 * bdev_destroy_cb() does not touch the bdev after calling destruct(), so
+	 * freeing the struct here is safe and matches the lifetime of a real
+	 * bdev whose memory is released during teardown.
+	 */
+	free(bdev);
+	free(ctx);
+	return 0;
+}
+
+static struct spdk_bdev_fn_table freeing_fn_table = {
+	.destruct = freeing_destruct,
+	.submit_request = stub_submit_request,
+	.get_io_channel = bdev_ut_get_io_channel,
+	.io_type_supported = stub_io_type_supported,
+};
+
+static struct spdk_bdev *
+allocate_freeing_bdev(char *name)
+{
+	struct spdk_bdev *bdev;
+	struct freeing_bdev_ctx *ctx;
+	int rc;
+
+	bdev = calloc(1, sizeof(*bdev));
+	SPDK_CU_ASSERT_FATAL(bdev != NULL);
+	ctx = calloc(1, sizeof(*ctx));
+	SPDK_CU_ASSERT_FATAL(ctx != NULL);
+	ctx->bdev = bdev;
+
+	bdev->ctxt = ctx;
+	bdev->name = name;
+	bdev->fn_table = &freeing_fn_table;
+	bdev->module = &bdev_ut_if;
+	bdev->blockcnt = 1024;
+	bdev->blocklen = 512;
+
+	spdk_uuid_generate(&bdev->uuid);
+
+	rc = spdk_bdev_register(bdev);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+
+	return bdev;
+}
+
+struct iterate_uaf_ctx {
+	int		count;
+	bool		triggered;
+	bool		freed_unprotected;
+};
+
+static int
+iterate_unregister_next_cb(void *ctx, struct spdk_bdev *bdev)
+{
+	struct iterate_uaf_ctx *uaf = ctx;
+	struct spdk_bdev *next;
+	struct freeing_bdev_ctx *next_ctx;
+
+	uaf->count++;
+
+	/*
+	 * On the first visited bdev, model what a concurrent reconnect-storm
+	 * teardown does to bdev[0]'s not-yet-visited successor.  In production
+	 * the successor's struct is destructed and freed on another reactor
+	 * thread (bdev_destroy_cb -> destruct -> nvme_bdev_free); that free is
+	 * NOT serialized by g_bdev_mgr.spinlock, and the iterator holds no
+	 * reference to the successor.
+	 *
+	 * spdk_for_each_bdev() pins the *current* bdev with a descriptor across
+	 * the lock-drop, but historically did NOT pin the *next* bdev.  We detect
+	 * that here: if the successor has no open descriptor, the iterator did
+	 * not protect it, so the concurrent free is allowed to complete -> we
+	 * destruct+free its struct, leaving the stale internal.link in place
+	 * exactly as observed in the production core (a freed, zeroed struct that
+	 * the iterator's spdk_bdev_next() still points at).  The unfixed iterator
+	 * then calls bdev_open() on that freed struct -> spdk_spin_lock() on a
+	 * zeroed/freed spinlock -> abort / ASan heap-use-after-free.
+	 *
+	 * With the fix the iterator has already opened a descriptor on the
+	 * successor before dropping the lock, so internal.open_descs is non-empty
+	 * here, the concurrent free is deferred (just as bdev_unregister_unsafe
+	 * returns -EBUSY), and we leave the bdev alone.  The iterator then safely
+	 * visits it.
+	 */
+	if (!uaf->triggered) {
+		uaf->triggered = true;
+		next = TAILQ_NEXT(bdev, internal.link);
+		if (next != NULL && TAILQ_EMPTY(&next->internal.open_descs)) {
+			/* Not pinned by the iterator: a concurrent teardown is free
+			 * to reclaim it.  Model the completed destruct + struct free
+			 * while leaving the stale list linkage dangling. */
+			next_ctx = next->ctxt;
+			spdk_spin_destroy(&next->internal.spinlock);
+			memset(next, 0, sizeof(*next));
+			free(next);
+			free(next_ctx);
+			uaf->freed_unprotected = true;
+		}
+	}
+
+	return 0;
+}
+
+static void
+for_each_bdev_unregister_uaf_test(void)
+{
+	struct spdk_bdev *bdev[3];
+	struct iterate_uaf_ctx uaf = {};
+
+	/*
+	 * Three bdevs in list order.  While visiting the first, a concurrent
+	 * teardown reclaims the (unprotected) successor's struct.  A correct
+	 * iterator must keep the successor alive (pinned) across the window so it
+	 * never dereferences freed memory.
+	 */
+	bdev[0] = allocate_freeing_bdev("uaf_bdev0");
+	bdev[1] = allocate_freeing_bdev("uaf_bdev1");
+	bdev[2] = allocate_freeing_bdev("uaf_bdev2");
+
+	uaf.count = 0;
+	uaf.triggered = false;
+	uaf.freed_unprotected = false;
+	spdk_for_each_bdev(&uaf, iterate_unregister_next_cb);
+
+	/*
+	 * With the fix, the successor was pinned so the concurrent free was
+	 * deferred (freed_unprotected stays false) and all three bdevs were
+	 * visited safely.  The decisive check is that no freed memory was touched
+	 * (ASan / the spinlock-not-initialized abort); the assertions document the
+	 * expected post-fix behaviour.
+	 */
+	CU_ASSERT(uaf.freed_unprotected == false);
+	CU_ASSERT(uaf.count == 3);
+
+	/* Clean up the bdevs that are still registered. */
+	spdk_bdev_unregister(bdev[0], NULL, NULL);
+	spdk_bdev_unregister(bdev[1], NULL, NULL);
+	spdk_bdev_unregister(bdev[2], NULL, NULL);
+	poll_threads();
+}
+
 static void
 for_each_bdev_test(void)
 {
@@ -8257,6 +8430,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_register_uuid_alias);
 	CU_ADD_TEST(suite, bdev_unregister_by_name);
 	CU_ADD_TEST(suite, for_each_bdev_test);
+	CU_ADD_TEST(suite, for_each_bdev_unregister_uaf_test);
 	CU_ADD_TEST(suite, bdev_seek_test);
 	CU_ADD_TEST(suite, bdev_copy);
 	CU_ADD_TEST(suite, bdev_copy_split_test);

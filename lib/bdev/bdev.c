@@ -9831,92 +9831,139 @@ spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
 	return desc->bdev;
 }
 
-int
-spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn)
+/*
+ * Open a descriptor (a "pin") on the first bdev at or after *bdev that can be
+ * opened, walking the list with next_fn().  Must be called with
+ * g_bdev_mgr.spinlock held.
+ *
+ * Holding an open descriptor keeps the bdev alive across a subsequent drop of
+ * g_bdev_mgr.spinlock: a concurrent unregister of a pinned bdev observes a
+ * non-empty internal.open_descs in bdev_unregister_unsafe() and defers
+ * (rc == -EBUSY), so the struct is not destructed/freed until we close the
+ * descriptor.  Bdevs that are already unregistering (bdev_open() returns
+ * -ENODEV) are skipped, matching the previous behaviour.
+ *
+ * On success *bdev is updated to the pinned bdev and *desc to its descriptor.
+ * When no openable bdev remains, *bdev is set to NULL and *desc is untouched.
+ * A non-zero return is a hard error (e.g. -ENOMEM) and *bdev is set to NULL.
+ */
+static int
+bdev_pin_next(struct spdk_bdev **bdev, struct spdk_bdev_desc **desc,
+	      struct spdk_bdev *(*next_fn)(struct spdk_bdev *prev), struct spdk_bdev *prev)
 {
-	struct spdk_bdev *bdev, *tmp;
-	struct spdk_bdev_desc *desc;
+	struct spdk_bdev *cur = *bdev;
+	struct spdk_bdev_desc *d;
+	int rc;
+
+	assert(spdk_spin_held(&g_bdev_mgr.spinlock));
+
+	while (cur != NULL) {
+		rc = bdev_desc_alloc(cur, _tmp_bdev_event_cb, NULL, NULL, &d);
+		if (rc != 0) {
+			*bdev = NULL;
+			return rc;
+		}
+		rc = bdev_open(cur, false, d);
+		if (rc == 0) {
+			*bdev = cur;
+			*desc = d;
+			return 0;
+		}
+		bdev_desc_free(d);
+		if (rc != -ENODEV) {
+			/* Hard error - propagate it. */
+			*bdev = NULL;
+			return rc;
+		}
+		/* Bdev is unregistering; skip it and try the next one. */
+		prev = cur;
+		cur = next_fn(prev);
+	}
+
+	*bdev = NULL;
+	return 0;
+}
+
+static int
+bdev_for_each_pinned(void *ctx, spdk_for_each_bdev_fn fn,
+		     struct spdk_bdev *(*first_fn)(void),
+		     struct spdk_bdev *(*next_fn)(struct spdk_bdev *prev))
+{
+	struct spdk_bdev *bdev, *next;
+	struct spdk_bdev_desc *desc, *next_desc;
 	int rc = 0;
 
 	assert(fn != NULL);
 
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	bdev = spdk_bdev_first();
+
+	/* Pin the first bdev we will visit (read the list head under the lock). */
+	bdev = first_fn();
+	rc = bdev_pin_next(&bdev, &desc, next_fn, NULL);
+	if (rc != 0) {
+		spdk_spin_unlock(&g_bdev_mgr.spinlock);
+		return rc;
+	}
+
 	while (bdev != NULL) {
-		rc = bdev_desc_alloc(bdev, _tmp_bdev_event_cb, NULL, NULL, &desc);
-		if (rc != 0) {
-			break;
-		}
-		rc = bdev_open(bdev, false, desc);
-		if (rc != 0) {
-			bdev_desc_free(desc);
-			if (rc == -ENODEV) {
-				/* Ignore the error and move to the next bdev. */
-				rc = 0;
-				bdev = spdk_bdev_next(bdev);
-				continue;
+		/*
+		 * Pin the next bdev *before* dropping the lock.  This keeps the
+		 * not-yet-visited bdev alive across fn() (and across the lock
+		 * drop), so a concurrent teardown cannot destruct and free it
+		 * out from under the iterator.  We compute next using the bdev
+		 * we are about to visit, which is still in the list because we
+		 * hold a descriptor on it.
+		 */
+		next = next_fn(bdev);
+		next_desc = NULL;
+		if (next != NULL) {
+			rc = bdev_pin_next(&next, &next_desc, next_fn, bdev);
+			if (rc != 0) {
+				/* Hard error pinning the next bdev: still close the
+				 * current pin and bail out without a leak. */
+				bdev_close(bdev, desc);
+				break;
 			}
-			break;
 		}
+
 		spdk_spin_unlock(&g_bdev_mgr.spinlock);
 
 		rc = fn(ctx, bdev);
 
 		spdk_spin_lock(&g_bdev_mgr.spinlock);
-		tmp = spdk_bdev_next(bdev);
+
+		/* Done with the current bdev; release its pin (this may let a
+		 * deferred unregister of it now proceed). */
 		bdev_close(bdev, desc);
+
 		if (rc != 0) {
+			/* Caller asked to stop; release the next pin too. */
+			if (next != NULL) {
+				bdev_close(next, next_desc);
+			}
 			break;
 		}
-		bdev = tmp;
+
+		/* Advance: the already-pinned next bdev becomes current. */
+		bdev = next;
+		desc = next_desc;
 	}
+
 	spdk_spin_unlock(&g_bdev_mgr.spinlock);
 
 	return rc;
 }
 
 int
+spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn)
+{
+	return bdev_for_each_pinned(ctx, fn, spdk_bdev_first, spdk_bdev_next);
+}
+
+int
 spdk_for_each_bdev_leaf(void *ctx, spdk_for_each_bdev_fn fn)
 {
-	struct spdk_bdev *bdev, *tmp;
-	struct spdk_bdev_desc *desc;
-	int rc = 0;
-
-	assert(fn != NULL);
-
-	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	bdev = spdk_bdev_first_leaf();
-	while (bdev != NULL) {
-		rc = bdev_desc_alloc(bdev, _tmp_bdev_event_cb, NULL, NULL, &desc);
-		if (rc != 0) {
-			break;
-		}
-		rc = bdev_open(bdev, false, desc);
-		if (rc != 0) {
-			bdev_desc_free(desc);
-			if (rc == -ENODEV) {
-				/* Ignore the error and move to the next bdev. */
-				rc = 0;
-				bdev = spdk_bdev_next_leaf(bdev);
-				continue;
-			}
-			break;
-		}
-		spdk_spin_unlock(&g_bdev_mgr.spinlock);
-
-		rc = fn(ctx, bdev);
-
-		spdk_spin_lock(&g_bdev_mgr.spinlock);
-		tmp = spdk_bdev_next_leaf(bdev);
-		bdev_close(bdev, desc);
-		if (rc != 0) {
-			break;
-		}
-		bdev = tmp;
-	}
-	spdk_spin_unlock(&g_bdev_mgr.spinlock);
-
-	return rc;
+	return bdev_for_each_pinned(ctx, fn, spdk_bdev_first_leaf, spdk_bdev_next_leaf);
 }
 
 int
