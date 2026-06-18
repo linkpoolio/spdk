@@ -453,6 +453,37 @@ raid_bdev_cleanup_and_free(struct raid_bdev *raid_bdev)
 	raid_bdev_free(raid_bdev);
 }
 
+/*
+ * Free a raid_bdev from a base-bdev-removal / delete path, but only when no
+ * bdev-layer destruct is in flight for it.
+ *
+ * When the last base bdev of a non-operational raid is removed, the raid was
+ * usually taken OFFLINE by raid_bdev_deconfigure(), which issues an
+ * asynchronous spdk_bdev_unregister(). That unregister's destruct
+ * (_raid_bdev_destruct -> ... -> raid_bdev_io_device_unregister_cb) is the
+ * owner of the free in that case. Freeing here while it is still in flight
+ * leaves the destruct running on freed memory -- observed in production as a
+ * SIGSEGV in _raid_bdev_destruct (raid_bdev->module == NULL on a freed,
+ * reused chunk) under a mass base-bdev removal storm.
+ *
+ * So: free now only if the bdev was never registered (state CONFIGURING, no
+ * destruct will come) or its destruct has already completed. Otherwise defer
+ * -- raid_bdev_io_device_unregister_cb frees once the destruct finishes (it
+ * checks num_base_bdevs_discovered == 0).
+ */
+static void
+raid_bdev_cleanup_and_free_unless_destruct_pending(struct raid_bdev *raid_bdev)
+{
+	if (raid_bdev->state == RAID_BDEV_STATE_OFFLINE && !raid_bdev->destruct_completed) {
+		/* Destruct in flight; it owns the free. */
+		SPDK_DEBUGLOG(bdev_raid,
+			      "deferring free of %s to in-flight destruct\n", raid_bdev->bdev.name);
+		return;
+	}
+
+	raid_bdev_cleanup_and_free(raid_bdev);
+}
+
 static void
 raid_bdev_deconfigure_base_bdev(struct raid_base_bdev_info *base_info)
 {
@@ -515,6 +546,12 @@ static void
 raid_bdev_io_device_unregister_cb(void *io_device)
 {
 	struct raid_bdev *raid_bdev = io_device;
+
+	/* The bdev-layer destruct has completed. From here it is safe for a
+	 * base-bdev-removal / delete path to free the raid_bdev; record that so
+	 * those paths (which may run before or after this callback) free exactly
+	 * once and never while the destruct was still in flight. */
+	raid_bdev->destruct_completed = true;
 
 	if (raid_bdev->num_base_bdevs_discovered == 0) {
 		/* Free raid_bdev when there are no base bdevs left */
@@ -2348,8 +2385,10 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
 		raid_bdev->base_bdev_updating = RAID_BDEV_UPDATE_NONE;
 		if (raid_bdev->num_base_bdevs_discovered == 0 &&
 		    raid_bdev->state == RAID_BDEV_STATE_OFFLINE) {
-			/* There is no base bdev for this raid, so free the raid device. */
-			raid_bdev_cleanup_and_free(raid_bdev);
+			/* There is no base bdev for this raid, so free the raid device --
+			 * unless a destruct from the deconfigure that took us OFFLINE is
+			 * still in flight, in which case it owns the free. */
+			raid_bdev_cleanup_and_free_unless_destruct_pending(raid_bdev);
 		}
 		if (cb_fn != NULL) {
 			cb_fn(cb_ctx, 0);
@@ -3024,8 +3063,11 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void 
 	}
 
 	if (raid_bdev->num_base_bdevs_discovered == 0) {
-		/* There is no base bdev for this raid, so free the raid device. */
-		raid_bdev_cleanup_and_free(raid_bdev);
+		/* There is no base bdev for this raid, so free the raid device --
+		 * unless a destruct is still in flight (the raid was already taken
+		 * OFFLINE by a prior deconfigure), in which case that destruct owns
+		 * the free and we must not pull the struct out from under it. */
+		raid_bdev_cleanup_and_free_unless_destruct_pending(raid_bdev);
 		if (cb_fn) {
 			cb_fn(cb_arg, 0);
 		}

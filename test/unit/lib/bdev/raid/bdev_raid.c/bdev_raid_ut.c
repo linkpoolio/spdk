@@ -131,10 +131,33 @@ ut_raid_submit_process_request(struct raid_bdev_process_request *process_req,
 	return process_req->num_blocks;
 }
 
+/* When set, ut_raid_stop() defers module-stop completion: it stashes the
+ * raid_bdev and returns false, leaving the bdev destruct in flight until the
+ * test calls raid_bdev_module_stop_done(). Used to reproduce the teardown
+ * race where base bdevs are removed while a destruct is still in flight. */
+static bool g_ut_raid_defer_stop;
+static struct raid_bdev *g_ut_raid_deferred_stop_bdev;
+
+static bool
+ut_raid_stop(struct raid_bdev *raid_bdev)
+{
+	if (g_ut_raid_defer_stop) {
+		g_ut_raid_deferred_stop_bdev = raid_bdev;
+		return false;
+	}
+	return true;
+}
+
+static void
+ut_raid_remove_base_cb(void *ctx, int status)
+{
+}
+
 static struct raid_bdev_module g_ut_raid_module = {
 	.level = 123,
 	.base_bdevs_min = 1,
 	.start = ut_raid_start,
+	.stop = ut_raid_stop,
 	.submit_rw_request = ut_raid_submit_rw_request,
 	.submit_null_payload_request = ut_raid_submit_null_payload_request,
 	.submit_process_request = ut_raid_submit_process_request,
@@ -2097,6 +2120,84 @@ test_raid_fail_base_remove_enodev_keeps_failed(void)
 	CU_ASSERT(base_info.is_failed == true);
 }
 
+/*
+ * Regression test for the teardown use-after-free: under a mass base-bdev
+ * removal storm, the first removal of a non-operational raid deconfigures it
+ * (ONLINE -> OFFLINE) and issues an asynchronous bdev unregister whose destruct
+ * is in flight; subsequent removals drive num_base_bdevs_discovered to 0. The
+ * base-removal path must NOT free the raid_bdev while that destruct is still in
+ * flight (the destruct owns the free) -- doing so left _raid_bdev_destruct
+ * running on freed memory (crash: raid_bdev->module == NULL). Here the module
+ * stop is deferred to keep the destruct in flight across the removals; without
+ * the fix the final removal frees the raid_bdev and the deferred destruct
+ * completion then faults (ASAN use-after-free).
+ */
+static void
+test_raid_bdev_free_deferred_until_destruct_done(void)
+{
+	struct rpc_bdev_raid_create construct_req;
+	struct raid_bdev *pbdev = NULL;
+	uint8_t i, num_bases;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	verify_raid_bdev_present("raid1", false);
+	create_raid_bdev_create_req(&construct_req, "raid1", 0, true, 0, false);
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev(&construct_req, true, RAID_BDEV_STATE_ONLINE);
+	free_test_req(&construct_req);
+
+	TAILQ_FOREACH(pbdev, &g_raid_bdev_list, global_link) {
+		if (strcmp(pbdev->bdev.name, "raid1") == 0) {
+			break;
+		}
+	}
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+
+	num_bases = pbdev->num_base_bdevs;
+	SPDK_CU_ASSERT_FATAL(num_bases >= 2);
+
+	/* Make the raid intolerant so the first base removal deconfigures it. */
+	pbdev->min_base_bdevs_operational = num_bases;
+
+	/* Keep the destruct in flight across the removals. */
+	g_ut_raid_defer_stop = true;
+	g_ut_raid_deferred_stop_bdev = NULL;
+
+	/* First removal: deconfigure -> OFFLINE + unregister; destruct parks on
+	 * the deferred module stop. */
+	CU_ASSERT(_raid_bdev_remove_base_bdev(&pbdev->base_bdev_info[0], ut_raid_remove_base_cb,
+					      NULL) == 0);
+	poll_app_thread();
+	CU_ASSERT(pbdev->state == RAID_BDEV_STATE_OFFLINE);
+	CU_ASSERT(pbdev->destruct_completed == false);
+	SPDK_CU_ASSERT_FATAL(g_ut_raid_deferred_stop_bdev == pbdev);
+
+	/* Remove the rest while the destruct is still in flight; the last one
+	 * drives discovered to 0. The raid_bdev must survive (free deferred). */
+	for (i = 1; i < num_bases; i++) {
+		CU_ASSERT(_raid_bdev_remove_base_bdev(&pbdev->base_bdev_info[i], ut_raid_remove_base_cb,
+						      NULL) == 0);
+		poll_app_thread();
+	}
+	CU_ASSERT(pbdev->num_base_bdevs_discovered == 0);
+	CU_ASSERT(pbdev->destruct_completed == false);
+
+	/* Finish the module stop: the destruct completes and frees the raid_bdev
+	 * exactly once. */
+	g_ut_raid_defer_stop = false;
+	raid_bdev_module_stop_done(g_ut_raid_deferred_stop_bdev);
+	poll_app_thread();
+
+	verify_raid_bdev_present("raid1", false);
+
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2125,6 +2226,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev);
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev_with_hole);
 	CU_ADD_TEST(suite, test_raid_fail_base_remove_enodev_keeps_failed);
+	CU_ADD_TEST(suite, test_raid_bdev_free_deferred_until_destruct_done);
 
 	spdk_thread_lib_init(test_new_thread_fn, 0);
 	g_app_thread = spdk_thread_create("app_thread", NULL);
