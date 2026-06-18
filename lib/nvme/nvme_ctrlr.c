@@ -590,6 +590,8 @@ int
 spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 {
 	struct spdk_nvme_ctrlr *ctrlr;
+	uint64_t disconnect_deadline;
+	int rc;
 
 	if (qpair == NULL) {
 		return 0;
@@ -608,12 +610,42 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 		return 0;
 	}
 
-	qpair->destroy_in_progress = 1;
-
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 
+	/* For async qpairs, the disconnect may not complete immediately. Poll until the qpair
+	 * reaches the DISCONNECTED state to ensure the poll group can be removed without error.
+	 * This prevents resource leaks when spdk_nvme_poll_group_remove() checks the qpair state.
+	 *
+	 * Bound the wait. Under a mass reconnect storm against a downed TCP target a qpair can
+	 * get stuck in DISCONNECTING (the socket teardown never finalises). An unbounded loop
+	 * here would peg this reactor forever, stalling every other qpair it serves and
+	 * cascading keep-alive timeouts across the node. Cap the spin; on timeout fall through
+	 * to the DISCONNECTED check below, which abandons the qpair rather than hang.
+	 */
+	disconnect_deadline = spdk_get_ticks() + spdk_get_ticks_hz();
+	while (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
+		spdk_nvme_qpair_process_completions(qpair, 0);
+		if (spdk_get_ticks() >= disconnect_deadline) {
+			NVME_CTRLR_ERRLOG(ctrlr,
+					  "qpair %u stuck in DISCONNECTING; abandoning after 1s to avoid reactor hang\n",
+					  qpair->id);
+			break;
+		}
+	}
+
+	if (nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTED) {
+		NVME_CTRLR_ERRLOG(ctrlr, "qpair is not in DISCONNECTED state: state=%d\n",
+				  nvme_qpair_get_state(qpair));
+		return 0;
+	}
+
 	if (qpair->poll_group && (qpair->active_proc == nvme_ctrlr_get_current_process(ctrlr))) {
-		spdk_nvme_poll_group_remove(qpair->poll_group->group, qpair);
+		rc = spdk_nvme_poll_group_remove(qpair->poll_group->group, qpair);
+		if (rc != 0) {
+			NVME_CTRLR_ERRLOG(ctrlr, "spdk_nvme_poll_group_remove() failed: rc=%s\n",
+					  spdk_strerror(abs(rc)));
+			return 0;
+		}
 	}
 
 	/* Do not retry. */

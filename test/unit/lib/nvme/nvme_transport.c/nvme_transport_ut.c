@@ -7,7 +7,7 @@
 #include "spdk/stdinc.h"
 #include "spdk_internal/cunit.h"
 #include "nvme/nvme_transport.c"
-#include "common/lib/test_env.c"
+#include "common/lib/ut_multithread.c"
 
 SPDK_LOG_REGISTER_COMPONENT(nvme)
 
@@ -228,6 +228,99 @@ test_ctrlr_get_memory_domains(void)
 	TAILQ_REMOVE(&g_spdk_nvme_transports, &new_transport, link);
 }
 
+
+static void
+ut_connect_cb(struct spdk_nvme_qpair *qpair, int status, void *cb_arg)
+{
+	int *out = cb_arg;
+
+	*out = status;
+}
+
+/* The async-connect poller holds a raw pointer to its qpair. A qpair that
+ * fails and is destroyed between poller ticks must not leave the poller
+ * running (production crash: tick dereferenced the freed qpair). Ownership is
+ * via qpair->connect_ctx: completion and destruction both clear it.
+ */
+static void
+test_qpair_async_connect_ownership(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct spdk_nvme_transport_poll_group tgroup = {};
+	struct spdk_nvme_poll_group group = {};
+	struct spdk_nvme_qpair qpair = {};
+	int status;
+
+	allocate_threads(1);
+	set_thread(0);
+
+	tgroup.group = &group;
+	qpair.ctrlr = &ctrlr;
+	qpair.poll_group = &tgroup;
+
+	/* Torn down between ticks: the state check completes with -ENXIO instead
+	 * of processing completions on a dead qpair.
+	 */
+	status = 1;
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_CONNECTING);
+	CU_ASSERT(start_async_qpair_connect(&qpair, ut_connect_cb, &status) == 0);
+	SPDK_CU_ASSERT_FATAL(qpair.connect_ctx != NULL);
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_DISCONNECTING);
+	spdk_delay_us(1000);
+	poll_threads();
+	CU_ASSERT(status == -ENXIO);
+	CU_ASSERT(qpair.connect_ctx == NULL);
+
+	/* Successful connect completes with 0 and releases ownership. */
+	status = 1;
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_CONNECTING);
+	CU_ASSERT(start_async_qpair_connect(&qpair, ut_connect_cb, &status) == 0);
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_CONNECTED);
+	spdk_delay_us(1000);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT(qpair.connect_ctx == NULL);
+
+	/* Destruction path: abort cancels the poller without invoking the
+	 * callback; a subsequent poll must be a no-op.
+	 */
+	status = 1;
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_CONNECTING);
+	CU_ASSERT(start_async_qpair_connect(&qpair, ut_connect_cb, &status) == 0);
+	SPDK_CU_ASSERT_FATAL(qpair.connect_ctx != NULL);
+	nvme_qpair_abort_async_connect(&qpair);
+	CU_ASSERT(qpair.connect_ctx == NULL);
+	spdk_delay_us(1000);
+	poll_threads();
+	CU_ASSERT(status == 1);
+
+	/* Abort is idempotent on a qpair with no in-flight connect. */
+	nvme_qpair_abort_async_connect(&qpair);
+	CU_ASSERT(qpair.connect_ctx == NULL);
+
+	/* A reconnect supersedes a stale in-flight connect context: the old
+	 * poller is cancelled (no double completion -- the callback must fire
+	 * exactly once) and the new context completes normally.
+	 */
+	status = 1;
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_CONNECTING);
+	CU_ASSERT(start_async_qpair_connect(&qpair, ut_connect_cb, &status) == 0);
+	SPDK_CU_ASSERT_FATAL(qpair.connect_ctx != NULL);
+	CU_ASSERT(start_async_qpair_connect(&qpair, ut_connect_cb, &status) == 0);
+	SPDK_CU_ASSERT_FATAL(qpair.connect_ctx != NULL);
+	nvme_qpair_set_state(&qpair, NVME_QPAIR_CONNECTED);
+	spdk_delay_us(1000);
+	poll_threads();
+	CU_ASSERT(status == 0);
+	CU_ASSERT(qpair.connect_ctx == NULL);
+	status = 1;
+	spdk_delay_us(2000);
+	poll_threads();
+	CU_ASSERT(status == 1);
+
+	free_threads();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -242,6 +335,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_transport_poll_group_disconnect_qpair);
 	CU_ADD_TEST(suite, test_nvme_transport_poll_group_add_remove);
 	CU_ADD_TEST(suite, test_ctrlr_get_memory_domains);
+	CU_ADD_TEST(suite, test_qpair_async_connect_ownership);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

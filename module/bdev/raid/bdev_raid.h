@@ -281,6 +281,14 @@ struct raid_bdev {
 	/* Set to true if destroy of this raid bdev is started. */
 	bool				destroy_started;
 
+	/* Set to true once the bdev-layer destruct has completed
+	 * (raid_bdev_io_device_unregister_cb has run). Until then, a destruct
+	 * issued by deconfigure/unregister is in flight and is the sole owner of
+	 * the raid_bdev free; base-bdev-removal / delete paths must NOT free the
+	 * struct or they pull it out from under the in-flight destruct (a
+	 * use-after-free that crashes in _raid_bdev_destruct). */
+	bool				destruct_completed;
+
 	/* Module for RAID-level specific operations */
 	struct raid_bdev_module		*module;
 

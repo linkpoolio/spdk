@@ -4606,8 +4606,12 @@ test_reset_bdev_ctrlr(void)
 
 	/* Path 2 recovers */
 	ctrlr2->fail_reset = false;
+	/* The failed reset above armed the ~1 Hz failover re-drive rate-limiter in
+	 * bdev_nvme_poll_adminq(). Advance the clock past that window so the
+	 * recovery re-drive is allowed to fire on the next poll.
+	 */
 	poll_threads();
-	spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+	spdk_delay_us(SPDK_SEC_TO_USEC);
 	poll_threads();
 
 	CU_ASSERT(ctrlr2->is_failed == false);
@@ -4658,8 +4662,11 @@ test_reset_bdev_ctrlr(void)
 
 	/* Path 1 recovers */
 	ctrlr1->fail_reset = false;
+	/* As above, advance past the ~1 Hz failover re-drive rate-limit window so
+	 * the recovery re-drive fires.
+	 */
 	poll_threads();
-	spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+	spdk_delay_us(SPDK_SEC_TO_USEC);
 	poll_threads();
 
 	CU_ASSERT(ctrlr1->is_failed == false);
@@ -4712,8 +4719,11 @@ test_reset_bdev_ctrlr(void)
 	/* Paths 1 and 2 recover */
 	ctrlr1->fail_reset = false;
 	ctrlr2->fail_reset = false;
+	/* As above, advance past the ~1 Hz failover re-drive rate-limit window so
+	 * the recovery re-drives fire for both paths.
+	 */
 	poll_threads();
-	spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+	spdk_delay_us(SPDK_SEC_TO_USEC);
 	poll_threads();
 
 	CU_ASSERT(ctrlr1->is_failed == false);
@@ -7935,6 +7945,150 @@ test_ns_remove_during_reset(void)
 }
 
 static void
+test_populate_reuses_removing_nbdev(void)
+{
+	/* Reproduces the production use-after-free: an nbdev whose last namespace
+	 * depopulated (ref==0 -> spdk_bdev_unregister) but whose destruct is deferred
+	 * by lib/bdev/bdev.c (open descriptor + reset_in_progress -> rc=-EBUSY, name
+	 * already freed, spdk_io_device_unregister NOT called). The nbdev lingers in
+	 * nbdev_ctrlr->bdevs with ref==0 and disk.internal.status==REMOVING. On
+	 * reconnect, nvme_ctrlr_populate_namespace() must NOT resurrect that dying
+	 * instance via nvme_bdev_ctrlr_get_bdev() (which matches NSID only) -- doing
+	 * so reuses a half-freed object and, once the deferred destruct finally runs,
+	 * frees an nbdev that the freshly-populated namespace still points at.
+	 */
+	struct spdk_nvme_path_id path = {};
+	struct spdk_bdev_nvme_ctrlr_opts opts = {};
+	struct spdk_nvme_ctrlr *ctrlr;
+	struct spdk_nvme_ctrlr_opts dopts = {.hostnqn = UT_HOSTNQN};
+	struct nvme_bdev_ctrlr *nbdev_ctrlr;
+	struct nvme_ctrlr *nvme_ctrlr;
+	const int STRING_SIZE = 32;
+	const char *attached_names[STRING_SIZE];
+	struct nvme_bdev *nbdev, *new_nbdev;
+	struct nvme_ns *nvme_ns, *new_nvme_ns;
+	int rc;
+
+	memset(attached_names, 0, sizeof(char *) * STRING_SIZE);
+	ut_init_trid(&path.trid);
+
+	set_thread(0);
+
+	ctrlr = ut_attach_ctrlr(&path.trid, 1, false, true);
+	SPDK_CU_ASSERT_FATAL(ctrlr != NULL);
+
+	g_ut_attach_ctrlr_status = 0;
+	g_ut_attach_bdev_count = 1;
+
+	opts.multipath = true;
+
+	rc = spdk_bdev_nvme_create(&path.trid, "nvme0", attached_names, STRING_SIZE,
+				   attach_ctrlr_done, NULL, &dopts, &opts);
+	CU_ASSERT(rc == 0);
+
+	spdk_delay_us(1000);
+	poll_threads();
+
+	nbdev_ctrlr = nvme_bdev_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nbdev_ctrlr != NULL);
+
+	nvme_ctrlr = nvme_bdev_ctrlr_get_ctrlr(nbdev_ctrlr, &path.trid, dopts.hostnqn);
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	nvme_ns = nvme_ctrlr_get_ns(nvme_ctrlr, 1);
+	SPDK_CU_ASSERT_FATAL(nvme_ns != NULL);
+
+	nbdev = nvme_bdev_ctrlr_get_bdev(nbdev_ctrlr, 1);
+	SPDK_CU_ASSERT_FATAL(nbdev != NULL);
+	CU_ASSERT(nvme_ns->bdev == nbdev);
+	CU_ASSERT(nbdev->ref == 1);
+
+	/* Model the state lib/bdev/bdev.c leaves the nbdev in after the last
+	 * namespace depopulated while an open descriptor + an in-progress reset
+	 * forced the destruct to be deferred:
+	 *   - nbdev->disk.internal.status = SPDK_BDEV_STATUS_REMOVING
+	 *   - nbdev->ref == 0
+	 *   - the old nvme_ns has been detached (nvme_ns->bdev = NULL) and the
+	 *     bdev's name has been freed in bdev.c
+	 *   - the nbdev is STILL on nbdev_ctrlr->bdevs (destruct deferred and, with
+	 *     a never-completing reset, never reaped)
+	 * We deliberately do NOT call bdev_nvme_destruct() here -- that is exactly
+	 * what is deferred in production.
+	 */
+	nbdev->disk.internal.status = SPDK_BDEV_STATUS_REMOVING;
+	nbdev->ref = 0;
+
+	pthread_mutex_lock(&nbdev->mutex);
+	TAILQ_REMOVE(&nbdev->nvme_ns_list, nvme_ns, tailq);
+	pthread_mutex_unlock(&nbdev->mutex);
+
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	nvme_ns->bdev = NULL;
+	RB_REMOVE(nvme_ns_tree, &nvme_ctrlr->namespaces, nvme_ns);
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+	nvme_ns_delete(nvme_ns);
+
+	/* The half-dead nbdev is still on nbdev_ctrlr->bdevs (its destruct is
+	 * deferred), but with the fix nvme_bdev_ctrlr_get_bdev() must no longer
+	 * hand it back, so populate cannot resurrect it. (Before the fix this
+	 * returned the dying nbdev and the populate below crashed / UAF'd.)
+	 */
+	CU_ASSERT(nvme_bdev_ctrlr_get_bdev(nbdev_ctrlr, 1) == NULL);
+
+	/* Reconnect repopulates the same NSID. This mirrors the body of
+	 * nvme_ctrlr_populate_namespaces()'s "found a new one" arm.
+	 */
+	new_nvme_ns = nvme_ns_create(nvme_ctrlr, 1, NULL);
+	SPDK_CU_ASSERT_FATAL(new_nvme_ns != NULL);
+	new_nvme_ns->ns = &ctrlr->ns[0];
+
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	RB_INSERT(nvme_ns_tree, &nvme_ctrlr->namespaces, new_nvme_ns);
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
+	nvme_ctrlr_populate_namespace(nvme_ctrlr, new_nvme_ns);
+
+	poll_threads();
+
+	/* The fix: populate must create a FRESH nbdev rather than resurrecting the
+	 * REMOVING one. So the newly-populated namespace must point at a different
+	 * nbdev, the dying nbdev must not have been resurrected (ref stays 0), and
+	 * get_bdev() must hand back the live instance.
+	 */
+	new_nbdev = new_nvme_ns->bdev;
+	SPDK_CU_ASSERT_FATAL(new_nbdev != NULL);
+	CU_ASSERT(new_nbdev != nbdev);
+	CU_ASSERT(nbdev->ref == 0);
+	CU_ASSERT(new_nbdev->ref == 1);
+	CU_ASSERT(new_nbdev->disk.internal.status != SPDK_BDEV_STATUS_REMOVING);
+	CU_ASSERT(nvme_bdev_ctrlr_get_bdev(nbdev_ctrlr, 1) == new_nbdev);
+
+	/* Now the deferred destruct of the OLD instance finally runs (its
+	 * never-completing reset would eventually be torn down). This frees the old
+	 * nbdev. With the bug, new_nvme_ns->bdev still pointed at the old nbdev, so
+	 * the line above and any subsequent I/O would touch freed memory; ASan
+	 * catches the heap-use-after-free. With the fix the old and new nbdevs are
+	 * distinct, so destruct of the old one is harmless.
+	 */
+	bdev_nvme_destruct(&nbdev->disk);
+	poll_threads();
+
+	/* The live namespace and its bdev are untouched. */
+	CU_ASSERT(new_nvme_ns->bdev == new_nbdev);
+	CU_ASSERT(new_nbdev->ref == 1);
+	CU_ASSERT(nvme_bdev_ctrlr_get_bdev(nbdev_ctrlr, 1) == new_nbdev);
+
+	rc = spdk_bdev_nvme_delete("nvme0", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
+}
+
+static void
 test_io_path_is_current(void)
 {
 	struct nvme_bdev_channel nbdev_ch = {
@@ -8525,6 +8679,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_disable_enable_ctrlr);
 	CU_ADD_TEST(suite, test_delete_ctrlr_done);
 	CU_ADD_TEST(suite, test_ns_remove_during_reset);
+	CU_ADD_TEST(suite, test_populate_reuses_removing_nbdev);
 	CU_ADD_TEST(suite, test_io_path_is_current);
 	CU_ADD_TEST(suite, test_bdev_reset_abort_io);
 	CU_ADD_TEST(suite, test_race_between_clear_pending_resets_and_reset_ctrlr_complete);

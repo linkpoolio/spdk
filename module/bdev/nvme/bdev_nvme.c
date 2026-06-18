@@ -460,9 +460,27 @@ nvme_bdev_ctrlr_get_bdev(struct nvme_bdev_ctrlr *nbdev_ctrlr, uint32_t nsid)
 	assert(spdk_thread_is_app_thread(NULL));
 
 	TAILQ_FOREACH(nbdev, &nbdev_ctrlr->bdevs, tailq) {
-		if (nbdev->nsid == nsid) {
-			break;
+		if (nbdev->nsid != nsid) {
+			continue;
 		}
+		/* Skip any instance that is being torn down. Its last namespace has
+		 * already depopulated (ref == 0) and/or spdk_bdev_unregister() is in
+		 * flight (disk status != READY). Such an instance can linger on this
+		 * list with its name storage already freed when its destruct is
+		 * deferred indefinitely (an open descriptor while a reset against a
+		 * downed target never completes). Handing it back to
+		 * nvme_ctrlr_populate_namespace() on reconnect would resurrect a
+		 * half-freed object (use-after-free) and collide on the freed name;
+		 * the caller creates a fresh bdev instead. The dying instance is
+		 * removed from this list by bdev_nvme_destruct() once its destruct
+		 * finally runs.
+		 */
+		if (nbdev->ref == 0 ||
+		    nbdev->disk.internal.status == SPDK_BDEV_STATUS_REMOVING ||
+		    nbdev->disk.internal.status == SPDK_BDEV_STATUS_UNREGISTERING) {
+			continue;
+		}
+		break;
 	}
 
 	return nbdev;
@@ -2029,10 +2047,37 @@ bdev_nvme_poll_adminq(void *arg)
 			 * and emit a NOTICE. Observed in production as ~231k
 			 * "Unable to perform failover, already in progress." lines in
 			 * ~15 min (~1.1 GB of log), saturating the SPDK reactor until
-			 * the liveness probe SIGKILLed spdk_tgt. Skipping the redundant
-			 * re-drive is safe: failover-while-resetting is a no-op anyway.
+			 * the liveness probe SIGKILLed spdk_tgt.
+			 *
+			 * Semantics delta vs the unguarded call: when a plain reset is
+			 * in flight (resetting set, in_failover clear), the unguarded
+			 * call took the -EINPROGRESS branch in
+			 * bdev_nvme_failover_ctrlr_unsafe and set pending_failover, so
+			 * a successful reset failed over immediately on completion.
+			 * With the guard, that failover happens one adminq poll later
+			 * (the admin qpair is still failed, so the next poll re-drives
+			 * it once resetting clears). Failed resets are unaffected:
+			 * bdev_nvme_reset_ctrlr_complete advances the trid itself.
+			 *
+			 * Rate-limit the re-drive. With reconnect_delay_sec == 0 (the
+			 * default) a permanently-failing reset against a downed target
+			 * clears resetting on completion and then this poll re-drives
+			 * failover again immediately, spinning at full reactor speed
+			 * (sub-millisecond, multiplied across every ctrlr on a lost
+			 * storage node). Cap re-drives to ~1 Hz per ctrlr so a dead
+			 * target costs ~1 reset attempt/sec instead of saturating the
+			 * reactor. A successful reset clears failover_redrive_tsc in
+			 * bdev_nvme_reset_ctrlr_complete, so healthy reconnects are
+			 * unaffected; ctrlr_loss_timeout (when configured) still fires.
 			 */
-			bdev_nvme_failover_ctrlr(nvme_ctrlr);
+			uint64_t now = spdk_get_ticks();
+			if (nvme_ctrlr->failover_redrive_tsc != 0 &&
+			    now - nvme_ctrlr->failover_redrive_tsc < spdk_get_ticks_hz()) {
+				/* Too soon since the last re-drive; wait for a later poll. */
+			} else {
+				nvme_ctrlr->failover_redrive_tsc = now;
+				bdev_nvme_failover_ctrlr(nvme_ctrlr);
+			}
 		}
 	} else if (spdk_nvme_ctrlr_get_admin_qp_failure_reason(nvme_ctrlr->ctrlr) !=
 		   SPDK_NVME_QPAIR_FAILURE_NONE) {
@@ -2279,6 +2324,27 @@ bdev_nvme_check_fast_io_fail_timeout(struct nvme_ctrlr *nvme_ctrlr)
 static void bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success);
 
 static void
+bdev_nvme_reset_ctrlr_complete_failed(void *ctx)
+{
+	struct nvme_ctrlr *nvme_ctrlr = ctx;
+
+	/* This is the deferred failure arm of nvme_ctrlr_disconnect(): the reset
+	 * sequence that issued the disconnect is still in flight, so resetting is
+	 * set. Make the deferred completion single-shot/idempotent: if resetting
+	 * has already been cleared (the sequence completed by some other path
+	 * between this send_msg and its delivery, or a duplicate message), do
+	 * nothing. bdev_nvme_reset_ctrlr_complete() must not run twice for one
+	 * reset -- doing so would clear a freshly-started reset's state, double
+	 * flush pending resets, and re-drive failover spuriously.
+	 */
+	if (!nvme_ctrlr->resetting) {
+		return;
+	}
+
+	bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
+}
+
+static void
 nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
 {
 	int rc;
@@ -2289,10 +2355,20 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb 
 	if (rc != 0) {
 		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
 
-		/* Disconnect fails if ctrlr is already resetting or removed. In this case,
-		 * fail the reset sequence immediately.
+		/* Disconnect fails (e.g. -EBUSY) while the underlying ctrlr is still
+		 * tearing down against a downed target. Fail the reset sequence, but
+		 * defer it to the next reactor iteration rather than completing inline:
+		 * nvme_ctrlr_disconnect() is itself called from
+		 * bdev_nvme_reset_ctrlr_complete() (the OP_DELAYED_RECONNECT path), so
+		 * completing synchronously here re-enters that function and, when the
+		 * disconnect keeps failing, recurses on the stack until it overflows
+		 * (observed as a sub-millisecond storm of "disconnecting ctrlr failed"
+		 * / "Resetting controller failed" ending in SIGSEGV). Deferring breaks
+		 * the recursion and lets adminq polling run so the disconnect can
+		 * actually finish.
 		 */
-		bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
+		spdk_thread_send_msg(spdk_get_thread(), bdev_nvme_reset_ctrlr_complete_failed,
+				     nvme_ctrlr);
 		return;
 	}
 
@@ -2449,6 +2525,8 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 	} else {
 		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Resetting controller successful.\n");
 		nvme_ctrlr->reset_start_tsc = 0;
+		/* Healthy reconnect: clear the adminq-poller re-drive backoff. */
+		nvme_ctrlr->failover_redrive_tsc = 0;
 	}
 
 	nvme_ctrlr->resetting = false;
@@ -3296,14 +3374,21 @@ bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 
 	if (nvme_ctrlr->resetting) {
 		if (!nvme_ctrlr->in_failover) {
-			NVME_CTRLR_NOTICELOG(nvme_ctrlr,
-					     "Reset is already in progress. Defer failover until reset completes.\n");
+			/* Debug level: re-driven once per qpair disconnect event; under a
+			 * mass transport outage this fires at an unbounded rate across
+			 * every controller and a NOTICE here floods the log from the
+			 * reactor thread. The deferral itself is recorded in
+			 * pending_failover; state transitions still log at NOTICE.
+			 */
+			NVME_CTRLR_DEBUGLOG(nvme_ctrlr,
+					    "Reset is already in progress. Defer failover until reset completes.\n");
 
 			/* Defer failover until reset completes. */
 			nvme_ctrlr->pending_failover = true;
 			return -EINPROGRESS;
 		} else {
-			NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Unable to perform failover, already in progress.\n");
+			/* Debug level: see the deferral branch above. */
+			NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Unable to perform failover, already in progress.\n");
 			return -EBUSY;
 		}
 	}
@@ -3311,14 +3396,16 @@ bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	bdev_nvme_failover_trid(nvme_ctrlr, remove, true);
 
 	if (nvme_ctrlr->reconnect_is_delayed) {
-		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Reconnect is already scheduled.\n");
+		/* Debug level: see the deferral branch above. */
+		NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Reconnect is already scheduled.\n");
 
 		/* We rely on the next reconnect for the failover. */
 		return -EALREADY;
 	}
 
 	if (nvme_ctrlr->disabled) {
-		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Controller is disabled.\n");
+		/* Debug level: see the deferral branch above. */
+		NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Controller is disabled.\n");
 
 		/* We rely on the enablement for the failover. */
 		return -EALREADY;
