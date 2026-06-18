@@ -503,18 +503,50 @@ struct nvme_connect_ctx {
 
     connect_complete_cb cb_fn;
     void *cb_arg;
+
+    /* in_poll is set while nvme_connect_poller is inside process_completions,
+     * which can re-entrantly tear this qpair down (mass reconnect storms free
+     * qpairs mid-poll). teardown records that such a re-entrant destroy fired
+     * while in_poll, so the running poller -- not the re-entrant caller --
+     * unregisters the poller and frees ctx once it unwinds. Freeing inline from
+     * inside the poll would leave the still-running poller using freed memory
+     * (the production "is_fabrics(NULL ctrlr)" crash: a fresh tick dereferencing
+     * a qpair whose chunk had been freed and partly overwritten). */
+    bool in_poll;
+    bool teardown;
 };
+
+/* Tear down the async-connect context. If called re-entrantly from inside the
+ * poller's own process_completions (in_poll), the qpair is detached now but the
+ * poller/ctx free is deferred to the poller's unwind via teardown -- otherwise
+ * we would free memory the running poller is about to touch. */
+static void
+nvme_connect_ctx_destroy(struct nvme_connect_ctx *ctx)
+{
+    if (ctx->qpair != NULL) {
+        ctx->qpair->connect_ctx = NULL;
+        ctx->qpair = NULL;
+    }
+
+    if (ctx->in_poll) {
+        ctx->teardown = true;
+        return;
+    }
+
+    spdk_poller_unregister(&ctx->poller);
+    free(ctx);
+}
 
 static void
 nvme_connect_complete(struct nvme_connect_ctx *ctx, int status)
 {
-    if (ctx->cb_fn) {
+    /* Only reached from nvme_connect_poller outside the in_poll window, so the
+     * qpair is still attached here; guard cb_fn defensively all the same. */
+    if (ctx->cb_fn && ctx->qpair != NULL) {
         ctx->cb_fn(ctx->qpair, status, ctx->cb_arg);
     }
 
-    ctx->qpair->connect_ctx = NULL;
-    spdk_poller_unregister(&ctx->poller);
-    free(ctx);
+    nvme_connect_ctx_destroy(ctx);
 }
 
 /* Cancel an in-flight async connect before its qpair is freed. The connect
@@ -534,9 +566,7 @@ nvme_qpair_abort_async_connect(struct spdk_nvme_qpair *qpair)
         return;
     }
 
-    qpair->connect_ctx = NULL;
-    spdk_poller_unregister(&ctx->poller);
-    free(ctx);
+    nvme_connect_ctx_destroy(ctx);
 }
 
 static int
@@ -546,6 +576,15 @@ nvme_connect_poller(void *arg)
     struct spdk_nvme_qpair *qpair = ctx->qpair;
     enum nvme_qpair_state state;
     int rc;
+
+    /* A previous tick's process_completions tore this qpair down re-entrantly
+     * and deferred the free to us (see nvme_connect_ctx_destroy). The qpair is
+     * gone; self-destruct without touching it. */
+    if (ctx->teardown || qpair == NULL) {
+        spdk_poller_unregister(&ctx->poller);
+        free(ctx);
+        return SPDK_POLLER_BUSY;
+    }
 
     /* Check the state before touching the transport: if the qpair already
      * left CONNECTING (connected, or torn down by a failed reconnect),
@@ -560,11 +599,24 @@ nvme_connect_poller(void *arg)
         return SPDK_POLLER_BUSY;
     }
 
+    /* process_completions below can free this qpair (and this ctx) re-entrantly
+     * via the disconnect/teardown path. Mark in_poll so that destroy defers the
+     * free to us instead of pulling memory out from under this stack frame. */
+    ctx->in_poll = true;
     if (ctx->poll_group && spdk_nvme_ctrlr_is_fabrics(qpair->ctrlr)) {
         rc = spdk_nvme_poll_group_process_completions(ctx->poll_group, 0,
                                                       nvme_transport_connect_qpair_fail);
     } else {
         rc = spdk_nvme_qpair_process_completions(qpair, 0);
+    }
+    ctx->in_poll = false;
+
+    /* The qpair was torn down underneath process_completions. The free was
+     * deferred to us; do it now and do not dereference the (freed) qpair. */
+    if (ctx->teardown || ctx->qpair == NULL) {
+        spdk_poller_unregister(&ctx->poller);
+        free(ctx);
+        return SPDK_POLLER_BUSY;
     }
 
     if (rc < 0) {
