@@ -6826,6 +6826,79 @@ for_each_bdev_unregister_uaf_test(void)
 	poll_threads();
 }
 
+struct iter_visit_ctx {
+	int count;
+	bool saw_after;
+};
+
+static int
+iter_visit_cb(void *ctx, struct spdk_bdev *bdev)
+{
+	struct iter_visit_ctx *v = ctx;
+
+	v->count++;
+	if (strcmp(spdk_bdev_get_name(bdev), "iter_bdev2") == 0) {
+		v->saw_after = true;
+	}
+	return 0;
+}
+
+/*
+ * A bdev mid-teardown (REMOVING, unregister deferred by an open descriptor) is
+ * still linked in the global list. spdk_for_each_bdev must SKIP it (bdev_open
+ * returns -ENODEV) yet CONTINUE and visit the bdev after it -- the removed
+ * bdev_list_link_valid_unsafe guard would have bailed the whole iteration at
+ * the edge, silently dropping the successor. When the deferred unregister
+ * later completes, the bdev is unlinked from the list and its name deleted
+ * BEFORE the struct is freed, so no later lookup/iteration walks freed memory
+ * (the invariant the simplified bdev_unregister_unsafe relies on; ASan catches
+ * a violation).
+ */
+static void
+for_each_bdev_continues_past_unregistering(void)
+{
+	struct spdk_bdev *bdev[3];
+	struct spdk_bdev_desc *desc = NULL;
+	struct iter_visit_ctx v;
+	int rc;
+
+	bdev[0] = allocate_freeing_bdev("iter_bdev0");
+	bdev[1] = allocate_freeing_bdev("iter_bdev1");
+	bdev[2] = allocate_freeing_bdev("iter_bdev2");
+
+	/* Pin the middle bdev (bdev_ut_event_cb is a no-op, so the hotremove event
+	 * does not close it), then unregister it -> deferred, sits in REMOVING. */
+	rc = spdk_bdev_open_ext("iter_bdev1", true, bdev_ut_event_cb, NULL, &desc);
+	CU_ASSERT(rc == 0);
+	spdk_bdev_unregister(bdev[1], NULL, NULL);
+	poll_threads();
+	CU_ASSERT(spdk_bdev_get_by_name("iter_bdev1") == bdev[1]);
+
+	v.count = 0;
+	v.saw_after = false;
+	rc = spdk_for_each_bdev(&v, iter_visit_cb);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(v.count == 2);        /* bdev0 + bdev2; the REMOVING bdev1 is skipped */
+	CU_ASSERT(v.saw_after == true); /* iteration continued past the REMOVING bdev */
+
+	/* Complete the deferred unregister; bdev1 is unlinked + name-deleted, then
+	 * freed by freeing_destruct. */
+	spdk_bdev_close(desc);
+	poll_threads();
+	CU_ASSERT(spdk_bdev_get_by_name("iter_bdev1") == NULL);
+
+	v.count = 0;
+	v.saw_after = false;
+	rc = spdk_for_each_bdev(&v, iter_visit_cb);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(v.count == 2);
+	CU_ASSERT(v.saw_after == true);
+
+	spdk_bdev_unregister(bdev[0], NULL, NULL);
+	spdk_bdev_unregister(bdev[2], NULL, NULL);
+	poll_threads();
+}
+
 static void
 for_each_bdev_test(void)
 {
@@ -8514,6 +8587,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_unregister_by_name);
 	CU_ADD_TEST(suite, for_each_bdev_test);
 	CU_ADD_TEST(suite, for_each_bdev_unregister_uaf_test);
+	CU_ADD_TEST(suite, for_each_bdev_continues_past_unregistering);
 	CU_ADD_TEST(suite, bdev_seek_test);
 	CU_ADD_TEST(suite, bdev_copy);
 	CU_ADD_TEST(suite, bdev_copy_split_test);
