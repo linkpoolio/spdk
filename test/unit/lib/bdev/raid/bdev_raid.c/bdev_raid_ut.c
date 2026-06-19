@@ -2198,6 +2198,121 @@ test_raid_bdev_free_deferred_until_destruct_done(void)
 	reset_globals();
 }
 
+static bool g_ut_for_each_dev_not_found;
+
+/* Log interceptor: spdk_for_each_channel() logs "could not find io_device" (and
+ * asserts(false) in a debug build) when called on an unregistered io_device.
+ * Capturing the log makes the regression below a deterministic gate even when
+ * asserts are compiled out. */
+static void
+ut_capture_for_each_err(int level, const char *file, const int line,
+			const char *func, const char *format, va_list args)
+{
+	if (format != NULL && strstr(format, "could not find io_device") != NULL) {
+		g_ut_for_each_dev_not_found = true;
+	}
+}
+
+/*
+ * Regression test for the faulty-state vs teardown use-after-unregister crash.
+ * A base bdev going faulty kicks off an asynchronous base-bdev removal whose
+ * completion (_raid_bdev_start_faulty_state) iterates the raid's channels via
+ * spdk_for_each_channel(). If the raid is torn down in the meantime -- another
+ * base failed, the raid lost redundancy, deconfigured (ONLINE -> OFFLINE) and
+ * its io_device was unregistered -- spdk_for_each_channel() hits assert(false)
+ * in thread.c because the device is no longer in g_io_devices (observed in
+ * production as a SIGABRT during a mass base-bdev failure storm, both base
+ * bdevs of a 2-base raid failing within seconds).
+ *
+ * Drive the raid to exactly that state: OFFLINE, destruct completed, io_device
+ * unregistered, but the raid_bdev still allocated (a base bdev is still
+ * discovered, so the unregister cb does not free it). Firing the stale faulty-
+ * state completion must be a no-op instead of asserting.
+ */
+static void
+test_raid_start_faulty_state_skips_when_not_online(void)
+{
+	struct rpc_bdev_raid_create construct_req;
+	struct raid_bdev *pbdev = NULL;
+	struct raid_bdev_delta_bitmap_ctx *start_ctx;
+	uint8_t i, num_bases;
+
+	set_globals();
+	CU_ASSERT(raid_bdev_init() == 0);
+
+	create_raid_bdev_create_req(&construct_req, "raid1", 0, true, 0, false);
+	rpc_bdev_raid_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err == 0);
+	verify_raid_bdev(&construct_req, true, RAID_BDEV_STATE_ONLINE);
+	free_test_req(&construct_req);
+
+	TAILQ_FOREACH(pbdev, &g_raid_bdev_list, global_link) {
+		if (strcmp(pbdev->bdev.name, "raid1") == 0) {
+			break;
+		}
+	}
+	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
+
+	num_bases = pbdev->num_base_bdevs;
+	SPDK_CU_ASSERT_FATAL(num_bases >= 2);
+
+	/* Make the raid intolerant so a single base removal deconfigures it. */
+	pbdev->min_base_bdevs_operational = num_bases;
+
+	/* Park the destruct so the raid_bdev survives across the teardown below. */
+	g_ut_raid_defer_stop = true;
+	g_ut_raid_deferred_stop_bdev = NULL;
+
+	/* Remove a single base: deconfigure -> OFFLINE + unregister. The remaining
+	 * base bdevs stay discovered, so the raid_bdev is not freed on unregister. */
+	CU_ASSERT(_raid_bdev_remove_base_bdev(&pbdev->base_bdev_info[0], ut_raid_remove_base_cb,
+					      NULL) == 0);
+	poll_app_thread();
+	CU_ASSERT(pbdev->state == RAID_BDEV_STATE_OFFLINE);
+	SPDK_CU_ASSERT_FATAL(g_ut_raid_deferred_stop_bdev == pbdev);
+	SPDK_CU_ASSERT_FATAL(pbdev->num_base_bdevs_discovered > 0);
+
+	/* Complete the module stop: spdk_io_device_unregister() runs and the raid's
+	 * io_device leaves g_io_devices. The unregister cb sees discovered > 0 and
+	 * does NOT free the raid_bdev. */
+	g_ut_raid_defer_stop = false;
+	raid_bdev_module_stop_done(g_ut_raid_deferred_stop_bdev);
+	poll_app_thread();
+	CU_ASSERT(pbdev->destruct_completed == true);
+
+	/* Fire a stale faulty-state completion for a still-present base. Before the
+	 * fix this called spdk_for_each_channel() on the unregistered io_device and
+	 * asserted(false); with the guard it is a no-op (and frees its context). */
+	start_ctx = calloc(1, sizeof(*start_ctx));
+	SPDK_CU_ASSERT_FATAL(start_ctx != NULL);
+	start_ctx->base_info = &pbdev->base_bdev_info[1];
+
+	g_ut_for_each_dev_not_found = false;
+	spdk_log_open(ut_capture_for_each_err);
+	_raid_bdev_start_faulty_state(start_ctx, 0);
+	/* The clear path (reached from the 600s clear poller in production) makes
+	 * the same spdk_for_each_channel() call and must be guarded too. It runs on
+	 * a still-present base, frees base_info->name, and completes via its cb. */
+	CU_ASSERT(_raid_bdev_base_bdev_clear_faulty_state(&pbdev->base_bdev_info[1], NULL, NULL) == 0);
+	spdk_log_open(NULL);
+	/* Both guards must have skipped spdk_for_each_channel() entirely: no
+	 * "could not find io_device" error, and no abort. */
+	CU_ASSERT(g_ut_for_each_dev_not_found == false);
+
+	/* Clean up: remove the remaining bases; the raid_bdev is freed once the last
+	 * one is gone (its destruct has already completed). */
+	for (i = 1; i < num_bases; i++) {
+		CU_ASSERT(_raid_bdev_remove_base_bdev(&pbdev->base_bdev_info[i], ut_raid_remove_base_cb,
+						      NULL) == 0);
+		poll_app_thread();
+	}
+	verify_raid_bdev_present("raid1", false);
+
+	raid_bdev_exit();
+	base_bdevs_cleanup();
+	reset_globals();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2227,6 +2342,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_raid_grow_base_bdev_with_hole);
 	CU_ADD_TEST(suite, test_raid_fail_base_remove_enodev_keeps_failed);
 	CU_ADD_TEST(suite, test_raid_bdev_free_deferred_until_destruct_done);
+	CU_ADD_TEST(suite, test_raid_start_faulty_state_skips_when_not_online);
 
 	spdk_thread_lib_init(test_new_thread_fn, 0);
 	g_app_thread = spdk_thread_create("app_thread", NULL);
