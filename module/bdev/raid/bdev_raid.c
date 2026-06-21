@@ -2479,6 +2479,26 @@ _raid_bdev_base_bdev_clear_faulty_state(void *arg, raid_bdev_destruct_cb cb_fn, 
 	ctx->cb_arg = cb_arg;
 
 	raid_bdev = base_info->raid_bdev;
+
+	/*
+	 * This can run from the 600s clear poller (or a clear RPC) long after the
+	 * faulty state started, by which point the raid may have been torn down --
+	 * deconfigured (ONLINE -> OFFLINE) and its io_device unregistered. Then
+	 * spdk_for_each_channel() asserts(false) in thread.c (device gone from
+	 * g_io_devices). The base state was already cleared above and a dying raid's
+	 * channels are going away regardless, so skip the per-channel clear and just
+	 * complete. Same teardown-vs-faulty-state race as _raid_bdev_start_faulty_state.
+	 */
+	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
+		SPDK_NOTICELOG("raid bdev %s is %s, not online; skipping clear faulty state channel iteration\n",
+			       raid_bdev->bdev.name, raid_bdev_state_to_str(raid_bdev->state));
+		if (ctx->cb_fn != NULL) {
+			ctx->cb_fn(ctx->cb_arg, 0);
+		}
+		free(ctx);
+		return 0;
+	}
+
 	spdk_for_each_channel(raid_bdev, raid_bdev_channel_clear_faulty_state, ctx,
 			      raid_bdev_channel_clear_faulty_state_done);
 
@@ -2577,6 +2597,27 @@ _raid_bdev_start_faulty_state(void *ctx, int status)
 		return;
 	}
 
+	/*
+	 * This completion runs after an asynchronous base-bdev removal. The raid bdev
+	 * may have started tearing down while that removal was in flight -- e.g. another
+	 * base bdev failed and the raid lost all redundancy, so raid_bdev_deconfigure()
+	 * set it OFFLINE and called spdk_bdev_unregister(). Once the raid's io_device is
+	 * unregistered it is no longer in g_io_devices, and spdk_for_each_channel() then
+	 * hits assert(false) in thread.c -- observed in production as a SIGABRT during a
+	 * mass base-bdev failure storm (both base bdevs of a 2-base raid failing within
+	 * seconds of each other). raid_bdev->state is set to OFFLINE before any
+	 * unregister/destruct begins and this callback runs on the app thread, so it is a
+	 * safe, early sentinel. Marking channels faulty is meaningless for a raid that is
+	 * no longer online, so skip the iteration and clean up.
+	 */
+	if (base_info->raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
+		SPDK_NOTICELOG("raid bdev %s is %s, not online; skipping start of faulty state for base bdev %s\n",
+			       base_info->raid_bdev->bdev.name,
+			       raid_bdev_state_to_str(base_info->raid_bdev->state), base_info->name);
+		free(start_ctx);
+		return;
+	}
+
 	spdk_for_each_channel(base_info->raid_bdev, raid_bdev_channel_start_faulty_state, start_ctx,
 			      raid_bdev_channel_start_faulty_state_done);
 }
@@ -2637,6 +2678,23 @@ _raid_bdev_base_bdev_stop_faulty_state(void *_ctx, int status)
 		SPDK_ERRLOG("Failed to quiesce raid bdev %s: %s\n",
 			    raid_bdev->bdev.name, spdk_strerror(-status));
 		raid_bdev_stop_faulty_state_done(ctx, status);
+		return;
+	}
+
+	/*
+	 * Quiesce has completed, but the raid may have been torn down in the meantime
+	 * (deconfigured ONLINE -> OFFLINE, io_device unregistered). spdk_for_each_channel()
+	 * would then assert(false) in thread.c. Skip the per-channel iteration and go
+	 * straight to the unquiesce + completion that the normal path runs anyway
+	 * (raid_bdev_channel_stop_faulty_state_done), so the earlier quiesce is still
+	 * balanced. Same teardown-vs-faulty-state race as _raid_bdev_start_faulty_state.
+	 */
+	if (raid_bdev->state != RAID_BDEV_STATE_ONLINE) {
+		SPDK_NOTICELOG("raid bdev %s is %s, not online; skipping stop faulty state channel iteration for base bdev %s\n",
+			       raid_bdev->bdev.name, raid_bdev_state_to_str(raid_bdev->state), base_info->name);
+		if (spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_stop_faulty_state_done, ctx) != 0) {
+			raid_bdev_stop_faulty_state_done(ctx, 0);
+		}
 		return;
 	}
 
