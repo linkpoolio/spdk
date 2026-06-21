@@ -1202,7 +1202,18 @@ nvmf_ctrlr_cc_timeout(void *ctx)
 	}
 
 	group = ctrlr->admin_qpair->group;
-	assert(group != NULL && group->sgroups != NULL);
+	if (group == NULL || group->sgroups == NULL) {
+		/* Teardown race: during a controller disconnect (cc reset/shutdown) the
+		 * admin qpair can be removed from its poll group (group set to NULL)
+		 * before the ctrlr->admin_qpair pointer itself is cleared. The cc timeout
+		 * poller -- armed when the disconnect started and firing here via the
+		 * interrupt-mode timerfd -- then lands in that window. There is nothing to
+		 * reset, and dereferencing group->sgroups below would crash (assert under
+		 * --enable-debug, NULL-deref segfault in a release build). Just return;
+		 * the controller teardown completes on its own. */
+		SPDK_NOTICELOG("Ctrlr %p poll group gone during cc timeout (teardown in progress)\n", ctrlr);
+		return SPDK_POLLER_IDLE;
+	}
 
 	for (ns = spdk_nvmf_subsystem_get_first_ns(ctrlr->subsys); ns != NULL;
 	     ns = spdk_nvmf_subsystem_get_next_ns(ctrlr->subsys, ns)) {
