@@ -3425,6 +3425,123 @@ test_nvmf_property_nssr(void)
 	CU_ASSERT(ctrlrA.vcprop.csts.bits.nssro == 0);
 }
 
+static int
+ut_reap_ch_create(void *io_device, void *ctx_buf)
+{
+	return 0;
+}
+
+static void
+ut_reap_ch_destroy(void *io_device, void *ctx_buf)
+{
+}
+
+static void
+test_nvmf_ctrlr_keep_alive_reap_redrive(void)
+{
+	struct spdk_nvmf_subsystem subsystem = {};
+	struct spdk_nvmf_tgt tgt = {};
+	struct spdk_nvmf_ctrlr ctrlr = {};
+	int rc;
+
+	subsystem.tgt = &tgt;
+	ctrlr.subsys = &subsystem;
+	ctrlr.thread = spdk_get_thread();
+	spdk_io_device_register(&tgt, ut_reap_ch_create, ut_reap_ch_destroy, sizeof(int), "ut_tgt_ka");
+
+	/* Arm + force keep-alive expiry. ticks_hz is 1e6 (1 tick/us), so the
+	 * timeout is last_keep_alive_tick + kato_ms * 1000 ticks. */
+	ctrlr.feat.keep_alive_timer.bits.kato = 1; /* ms */
+	ctrlr.last_keep_alive_tick = 0;
+	MOCK_SET(spdk_get_ticks, 1000000); /* far past a 1ms (1000-tick) timeout */
+
+	/* Tick 1: first timeout -> latch CFS once and launch the reap. */
+	CU_ASSERT(ctrlr.vcprop.csts.bits.cfs == 0);
+	rc = nvmf_ctrlr_keep_alive_poll(&ctrlr);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(ctrlr.vcprop.csts.bits.cfs == 1);
+	CU_ASSERT(ctrlr.keep_alive_reap_in_progress == true);
+	poll_threads();
+	/* for_each_channel completion clears the in-progress guard. */
+	CU_ASSERT(ctrlr.keep_alive_reap_in_progress == false);
+
+	/* Tick 2: CFS is already set. The original bug gated the reap on cfs==0,
+	 * so a stranded controller was never reaped again (poller spun, logging
+	 * forever, controller leaked). The fix re-drives the reap every tick. */
+	rc = nvmf_ctrlr_keep_alive_poll(&ctrlr);
+	CU_ASSERT(rc == SPDK_POLLER_BUSY);
+	CU_ASSERT(ctrlr.keep_alive_reap_in_progress == true); /* re-driven despite cfs==1 */
+	poll_threads();
+	CU_ASSERT(ctrlr.keep_alive_reap_in_progress == false);
+
+	/* Guard: a reap already in flight must not launch an overlapping pass. */
+	ctrlr.keep_alive_reap_in_progress = true;
+	nvmf_ctrlr_drive_reap(&ctrlr);
+	CU_ASSERT(ctrlr.keep_alive_reap_in_progress == true);
+	ctrlr.keep_alive_reap_in_progress = false;
+
+	/* A controller in destruct stops the timer rather than re-driving. */
+	ctrlr.in_destruct = true;
+	rc = nvmf_ctrlr_keep_alive_poll(&ctrlr);
+	CU_ASSERT(rc == SPDK_POLLER_IDLE);
+	CU_ASSERT(ctrlr.keep_alive_reap_in_progress == false);
+	ctrlr.in_destruct = false;
+
+	MOCK_CLEAR(spdk_get_ticks);
+	spdk_io_device_unregister(&tgt, NULL);
+	poll_threads();
+}
+
+static void
+test_nvmf_subsystem_supersede_ctrlrs(void)
+{
+	struct spdk_nvmf_subsystem subsystem = {};
+	struct spdk_nvmf_tgt tgt = {};
+	struct spdk_nvmf_ctrlr cur = {}, same1 = {}, same2 = {}, other = {};
+	struct spdk_uuid host_a, host_b;
+
+	subsystem.tgt = &tgt;
+	TAILQ_INIT(&subsystem.ctrlrs);
+	spdk_io_device_register(&tgt, ut_reap_ch_create, ut_reap_ch_destroy, sizeof(int), "ut_tgt_sup");
+
+	memset(&host_a, 0xAA, sizeof(host_a));
+	memset(&host_b, 0xBB, sizeof(host_b));
+
+#define UT_INIT_CTRLR(c, nqn, hid) do {						\
+		(c).subsys = &subsystem;					\
+		(c).thread = spdk_get_thread();					\
+		snprintf((c).hostnqn, sizeof((c).hostnqn), "%s", (nqn));	\
+		spdk_uuid_copy(&(c).hostid, &(hid));				\
+		TAILQ_INSERT_TAIL(&subsystem.ctrlrs, &(c), link);		\
+	} while (0)
+	UT_INIT_CTRLR(same1, "nqn.2014-08.org.nvmexpress:uuid:hostA", host_a);
+	UT_INIT_CTRLR(same2, "nqn.2014-08.org.nvmexpress:uuid:hostA", host_a);
+	UT_INIT_CTRLR(other, "nqn.2014-08.org.nvmexpress:uuid:hostB", host_b);
+	UT_INIT_CTRLR(cur,   "nqn.2014-08.org.nvmexpress:uuid:hostA", host_a); /* the new connection */
+#undef UT_INIT_CTRLR
+
+	nvmf_subsystem_reap_superseded_ctrlrs(&subsystem, &cur);
+	poll_threads();
+
+	/* Prior controllers from the same host (nqn + hostid) are reaped (CFS
+	 * latched); a different host is left alone, and the new controller never
+	 * reaps itself. */
+	CU_ASSERT(same1.vcprop.csts.bits.cfs == 1);
+	CU_ASSERT(same2.vcprop.csts.bits.cfs == 1);
+	CU_ASSERT(other.vcprop.csts.bits.cfs == 0);
+	CU_ASSERT(cur.vcprop.csts.bits.cfs == 0);
+
+	/* A same-host prior already in destruct must be skipped (no double reap). */
+	same1.vcprop.csts.bits.cfs = 0;
+	same1.in_destruct = true;
+	nvmf_subsystem_reap_superseded_ctrlrs(&subsystem, &cur);
+	poll_threads();
+	CU_ASSERT(same1.vcprop.csts.bits.cfs == 0);
+
+	spdk_io_device_unregister(&tgt, NULL);
+	poll_threads();
+}
+
 static void
 test_nvmf_ctrlr_get_features_host_behavior_support(void)
 {
@@ -3894,6 +4011,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_zcopy_write);
 	CU_ADD_TEST(suite, test_nvmf_property_set);
 	CU_ADD_TEST(suite, test_nvmf_property_nssr);
+	CU_ADD_TEST(suite, test_nvmf_ctrlr_keep_alive_reap_redrive);
+	CU_ADD_TEST(suite, test_nvmf_subsystem_supersede_ctrlrs);
 	CU_ADD_TEST(suite, test_nvmf_ctrlr_get_features_host_behavior_support);
 	CU_ADD_TEST(suite, test_nvmf_ctrlr_set_features_host_behavior_support);
 	CU_ADD_TEST(suite, test_nvmf_ctrlr_ns_attachment);

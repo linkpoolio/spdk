@@ -103,16 +103,6 @@ nvmf_ctrlr_stop_association_timer(struct spdk_nvmf_ctrlr *ctrlr)
 	spdk_poller_unregister(&ctrlr->association_timer);
 }
 
-static void
-nvmf_ctrlr_disconnect_qpairs_done(struct spdk_io_channel_iter *i, int status)
-{
-	if (status == 0) {
-		SPDK_DEBUGLOG(nvmf, "ctrlr disconnect qpairs complete successfully\n");
-	} else {
-		SPDK_ERRLOG("Fail to disconnect ctrlr qpairs\n");
-	}
-}
-
 static int
 _nvmf_ctrlr_disconnect_qpairs_on_pg(struct spdk_io_channel_iter *i, bool include_admin)
 {
@@ -155,6 +145,42 @@ nvmf_ctrlr_disconnect_io_qpairs_on_pg(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, _nvmf_ctrlr_disconnect_qpairs_on_pg(i, false));
 }
 
+static void
+nvmf_ctrlr_reap_qpairs_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = spdk_io_channel_iter_get_ctx(i);
+
+	/* Allow the next tick (keep-alive poll) or supersede pass to re-drive the
+	 * disconnect if any qpair survived this pass. */
+	ctrlr->keep_alive_reap_in_progress = false;
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to disconnect qpairs while reaping ctrlr 0x%hx (host %s)\n",
+			    ctrlr->cntlid, ctrlr->hostnqn);
+	}
+}
+
+/*
+ * Drive a timed-out / superseded controller toward destruction by disconnecting
+ * its qpairs. A controller is destructed only when its LAST qpair leaves, so a
+ * single disconnect pass that races or drops a qpair strands the controller
+ * forever (CFS latched, poller spinning). Re-driving on each call, guarded so we
+ * never launch overlapping spdk_for_each_channel iterations, lets a stranded
+ * qpair get reaped on a later pass. Safe to call repeatedly: qpair disconnect is
+ * idempotent (-EINPROGRESS is treated as success).
+ */
+static void
+nvmf_ctrlr_drive_reap(struct spdk_nvmf_ctrlr *ctrlr)
+{
+	if (ctrlr->in_destruct || ctrlr->keep_alive_reap_in_progress) {
+		return;
+	}
+	ctrlr->keep_alive_reap_in_progress = true;
+	spdk_for_each_channel(ctrlr->subsys->tgt,
+			      nvmf_ctrlr_disconnect_qpairs_on_pg,
+			      ctrlr,
+			      nvmf_ctrlr_reap_qpairs_done);
+}
+
 static int
 nvmf_ctrlr_keep_alive_poll(void *ctx)
 {
@@ -173,23 +199,26 @@ nvmf_ctrlr_keep_alive_poll(void *ctx)
 	keep_alive_timeout_tick = ctrlr->last_keep_alive_tick +
 				  ctrlr->feat.keep_alive_timer.bits.kato * spdk_get_ticks_hz() / UINT64_C(1000);
 	if (now > keep_alive_timeout_tick) {
-		SPDK_NOTICELOG("Disconnecting host %s from subsystem %s due to keep alive timeout.\n",
-			       ctrlr->hostnqn, ctrlr->subsys->subnqn);
-		/* set the Controller Fatal Status bit to '1' */
+		/* Log + latch fatal status exactly once. Previously this log sat
+		 * above the cfs guard and fired on every tick, flooding once a
+		 * controller stranded; keep it inside the guard. */
 		if (ctrlr->vcprop.csts.bits.cfs == 0) {
+			SPDK_NOTICELOG("Disconnecting host %s from subsystem %s due to keep alive timeout.\n",
+				       ctrlr->hostnqn, ctrlr->subsys->subnqn);
+			/* set the Controller Fatal Status bit to '1' */
 			nvmf_ctrlr_set_fatal_status(ctrlr);
-
-			/*
-			 * disconnect qpairs, terminate Transport connection
-			 * destroy ctrlr, break the host to controller association
-			 * disconnect qpairs with qpair->ctrlr == ctrlr
-			 */
-			spdk_for_each_channel(ctrlr->subsys->tgt,
-					      nvmf_ctrlr_disconnect_qpairs_on_pg,
-					      ctrlr,
-					      nvmf_ctrlr_disconnect_qpairs_done);
-			return SPDK_POLLER_BUSY;
 		}
+
+		/*
+		 * Re-drive the qpair disconnect every tick until the controller is
+		 * actually destructed (which unregisters this poller via in_destruct).
+		 * The old code only attempted this once, under cfs==0, so a stranded
+		 * qpair left the controller immortal: the poller spun forever and the
+		 * kernel, unable to resume a CFS=1 controller, reconnected with a fresh
+		 * cntlid each time, leaking controllers without bound.
+		 */
+		nvmf_ctrlr_drive_reap(ctrlr);
+		return SPDK_POLLER_BUSY;
 	}
 
 	return SPDK_POLLER_IDLE;
@@ -344,6 +373,53 @@ _nvmf_ctrlr_add_admin_qpair(void *ctx)
 	nvmf_ctrlr_add_qpair(qpair, ctrlr, req);
 }
 
+/* Runs on a stale controller's own thread: latch fatal status (once) and drive
+ * its reap. Invoked when a new connection from the same host supersedes it. */
+static void
+_nvmf_ctrlr_supersede_reap(void *ctx)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = ctx;
+
+	if (ctrlr->in_destruct) {
+		return;
+	}
+	if (ctrlr->vcprop.csts.bits.cfs == 0) {
+		SPDK_NOTICELOG("Reaping stale controller 0x%hx (host %s, subsystem %s): superseded by a new connection from the same host.\n",
+			       ctrlr->cntlid, ctrlr->hostnqn, ctrlr->subsys->subnqn);
+		nvmf_ctrlr_set_fatal_status(ctrlr);
+	}
+	nvmf_ctrlr_drive_reap(ctrlr);
+}
+
+/*
+ * In our single-initiator-per-volume model a host holds at most one controller
+ * per subsystem. A reconnecting host Connects a fresh cntlid (the kernel cannot
+ * resume a controller it has abandoned), so any prior controller from the same
+ * host (hostnqn + hostid) on this subsystem is a dead association. Reap it now
+ * rather than wait out its keep-alive, so dead controllers cannot accumulate
+ * across reconnects. Each victim is reaped on its own thread. Runs on the
+ * subsystem thread, where subsystem->ctrlrs is mutated.
+ */
+static void
+nvmf_subsystem_reap_superseded_ctrlrs(struct spdk_nvmf_subsystem *subsystem,
+				      struct spdk_nvmf_ctrlr *new_ctrlr)
+{
+	struct spdk_nvmf_ctrlr *ctrlr, *tmp;
+
+	TAILQ_FOREACH_SAFE(ctrlr, &subsystem->ctrlrs, link, tmp) {
+		if (ctrlr == new_ctrlr || ctrlr->in_destruct) {
+			continue;
+		}
+		if (strncmp(ctrlr->hostnqn, new_ctrlr->hostnqn, sizeof(ctrlr->hostnqn)) != 0) {
+			continue;
+		}
+		if (spdk_uuid_compare(&ctrlr->hostid, &new_ctrlr->hostid) != 0) {
+			continue;
+		}
+		spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_supersede_reap, ctrlr);
+	}
+}
+
 static void
 _nvmf_subsystem_add_ctrlr(void *ctx)
 {
@@ -361,6 +437,10 @@ _nvmf_subsystem_add_ctrlr(void *ctx)
 		spdk_nvmf_request_complete(req);
 		return;
 	}
+
+	/* Reap any prior controller from the same host on this subsystem (left
+	 * behind by a reconnect) so dead associations cannot accumulate. */
+	nvmf_subsystem_reap_superseded_ctrlrs(ctrlr->subsys, ctrlr);
 
 	spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_add_admin_qpair, req);
 }
@@ -460,6 +540,7 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	ctrlr->subsys = subsystem;
 	ctrlr->thread = req->qpair->group->thread;
 	ctrlr->disconnect_in_progress = false;
+	ctrlr->keep_alive_reap_in_progress = false;
 	ctrlr->executing_nssr = false;
 
 	ctrlr->qpair_mask = spdk_bit_array_create(transport->opts.max_qpairs_per_ctrlr);
@@ -2203,7 +2284,7 @@ nvmf_ctrlr_set_features_number_of_queues(struct spdk_nvmf_request *req)
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ctrlr) == 4936,
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ctrlr) == 4944,
 		   "Please check migration fields that need to be added or not");
 
 static void

@@ -319,6 +319,10 @@ struct spdk_nvmf_ctrlr {
 
 	bool				dif_insert_or_strip;
 	bool				in_destruct;
+	/* Set while a keep-alive-timeout (or supersede) qpair-disconnect pass is
+	 * in flight, so the keep-alive poller re-drives the reap on later ticks
+	 * without launching overlapping spdk_for_each_channel iterations. */
+	bool				keep_alive_reap_in_progress;
 	bool				disconnect_in_progress;
 	/* valid only when disconnect_in_progress is true */
 	bool				disconnect_is_shn;
