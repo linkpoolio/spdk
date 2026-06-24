@@ -135,6 +135,16 @@ struct nvme_ctrlr {
 	 * Cleared on a successful reset. See bdev_nvme_poll_adminq. */
 	uint64_t				failover_redrive_tsc;
 	struct spdk_poller			*reconnect_delay_timer;
+	/* One-shot poller that spaces out the reset-complete-retry when the
+	 * underlying spdk_nvme_ctrlr_disconnect() returns -EBUSY. Without it
+	 * the retry fires every reactor tick (sub-millisecond) and — because
+	 * resetting was already cleared by bdev_nvme_reset_ctrlr_complete() —
+	 * the deferred bdev_nvme_reset_ctrlr_complete_failed() is a no-op,
+	 * leaving the controller in limbo until the adminq poller re-drives
+	 * failover at ~1 Hz. Setting this poller gates the adminq re-drive
+	 * via reconnect_is_delayed so retries are spaced reconnect_delay_sec
+	 * apart, matching the normal OP_DELAYED_RECONNECT path. */
+	struct spdk_poller			*ebusy_retry_timer;
 
 	nvme_ctrlr_disconnected_cb		disconnected_cb;
 

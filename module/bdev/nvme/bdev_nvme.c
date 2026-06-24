@@ -835,6 +835,7 @@ nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 	int rc;
 
 	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
+	spdk_poller_unregister(&nvme_ctrlr->ebusy_retry_timer);
 
 	if (spdk_interrupt_mode_is_enabled()) {
 		spdk_interrupt_unregister(&nvme_ctrlr->intr);
@@ -2344,6 +2345,24 @@ bdev_nvme_reset_ctrlr_complete_failed(void *ctx)
 	bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
 }
 
+/* The EBUSY retry timer fires reconnect_delay_sec after the underlying
+ * spdk_nvme_ctrlr_disconnect() returned -EBUSY. By the time it fires, the
+ * qpair teardown has had time to progress (the adminq poller kept running
+ * during the delay). We clear reconnect_is_delayed so the adminq poller
+ * can re-drive failover on its next poll, which will attempt a fresh reset
+ * — not a tight retry loop. ctrlr_loss_timeout accumulates across all
+ * retries (reset_start_tsc is never reset on failure), so the controller
+ * is still destructed after ctrlr_loss_timeout_sec total. */
+static int
+bdev_nvme_ebusy_retry_timer_expired(void *ctx)
+{
+	struct nvme_ctrlr *nvme_ctrlr = ctx;
+
+	spdk_poller_unregister(&nvme_ctrlr->ebusy_retry_timer);
+	nvme_ctrlr->reconnect_is_delayed = false;
+	return SPDK_POLLER_BUSY;
+}
+
 static void
 nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
 {
@@ -2356,19 +2375,39 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb 
 		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
 
 		/* Disconnect fails (e.g. -EBUSY) while the underlying ctrlr is still
-		 * tearing down against a downed target. Fail the reset sequence, but
-		 * defer it to the next reactor iteration rather than completing inline:
-		 * nvme_ctrlr_disconnect() is itself called from
-		 * bdev_nvme_reset_ctrlr_complete() (the OP_DELAYED_RECONNECT path), so
-		 * completing synchronously here re-enters that function and, when the
-		 * disconnect keeps failing, recurses on the stack until it overflows
-		 * (observed as a sub-millisecond storm of "disconnecting ctrlr failed"
-		 * / "Resetting controller failed" ending in SIGSEGV). Deferring breaks
-		 * the recursion and lets adminq polling run so the disconnect can
-		 * actually finish.
+		 * tearing down against a downed target. The previous fix (acb69478f)
+		 * deferred via spdk_thread_send_msg to break the stack recursion.
+		 * But the deferred callback is a no-op (resetting was already cleared
+		 * by bdev_nvme_reset_ctrlr_complete before calling us), so the
+		 * controller sits in limbo until the adminq poller re-drives failover
+		 * at ~1 Hz — a tight loop that wastes reactor cycles for the full
+		 * ctrlr_loss_timeout window (observed in production: 4 reactors at
+		 * 100% across every consumer IM during a storage-node restart).
+		 *
+		 * Instead, gate the retry with reconnect_delay_sec via a one-shot
+		 * timer. reconnect_is_delayed prevents the adminq poller from
+		 * re-driving failover during the delay; the adminq poller itself
+		 * stays running (NOT paused) so it can continue polling the qpair to
+		 * complete the underlying TCP teardown. After the delay, the timer
+		 * clears reconnect_is_delayed and the adminq re-drives naturally.
+		 * ctrlr_loss_timeout still accumulates (reset_start_tsc is never
+		 * reset on failure), so the controller is destructed after
+		 * ctrlr_loss_timeout_sec total regardless of how many EBUSY retries
+		 * occur.
 		 */
-		spdk_thread_send_msg(spdk_get_thread(), bdev_nvme_reset_ctrlr_complete_failed,
-				     nvme_ctrlr);
+		if (nvme_ctrlr->opts.reconnect_delay_sec != 0 &&
+		    nvme_ctrlr->ebusy_retry_timer == NULL) {
+			nvme_ctrlr->reconnect_is_delayed = true;
+			nvme_ctrlr->ebusy_retry_timer = SPDK_POLLER_REGISTER(
+				bdev_nvme_ebusy_retry_timer_expired, nvme_ctrlr,
+				nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
+		} else {
+			/* reconnect_delay_sec == 0: no delay to apply, fall back to the
+			 * immediate send_msg (the original recursion-break behavior). */
+			spdk_thread_send_msg(spdk_get_thread(),
+					     bdev_nvme_reset_ctrlr_complete_failed,
+					     nvme_ctrlr);
+		}
 		return;
 	}
 
@@ -2460,15 +2499,19 @@ bdev_nvme_reconnect_delay_timer_expired(void *ctx)
 static void
 bdev_nvme_start_reconnect_delay_timer(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* Cancel any pending EBUSY retry timer — the qpair has finished
+	 * disconnecting (that's why this callback was invoked), so the
+	 * normal reconnect_delay_timer path takes over. */
+	spdk_poller_unregister(&nvme_ctrlr->ebusy_retry_timer);
+
 	spdk_poller_pause(nvme_ctrlr->adminq_timer_poller);
 
-	assert(nvme_ctrlr->reconnect_is_delayed == false);
 	nvme_ctrlr->reconnect_is_delayed = true;
 
 	assert(nvme_ctrlr->reconnect_delay_timer == NULL);
 	nvme_ctrlr->reconnect_delay_timer = SPDK_POLLER_REGISTER(bdev_nvme_reconnect_delay_timer_expired,
-					    nvme_ctrlr,
-					    nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
+				    nvme_ctrlr,
+				    nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
 }
 
 static void remove_discovery_entry(struct nvme_ctrlr *nvme_ctrlr);

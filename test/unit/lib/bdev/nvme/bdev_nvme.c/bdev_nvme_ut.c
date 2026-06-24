@@ -327,6 +327,7 @@ struct spdk_nvme_ctrlr {
 	bool				is_failed;
 	bool				fail_reset;
 	bool				is_removed;
+	bool				fail_disconnect;
 	spdk_nvme_aer_cb		aer_cb_fn;
 	struct spdk_nvme_transport_id	trid;
 	TAILQ_HEAD(, spdk_nvme_qpair)	active_io_qpairs;
@@ -881,6 +882,13 @@ spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr)
 {
 	if (ctrlr->is_removed) {
 		return -ENXIO;
+	}
+
+	/* Simulate -EBUSY from the NVMe driver when the qpair teardown is
+	 * still in progress (the production condition the EBUSY retry timer
+	 * fix targets). */
+	if (ctrlr->fail_disconnect) {
+		return -EBUSY;
 	}
 
 	ctrlr->adminq.is_connected = false;
@@ -8619,6 +8627,155 @@ test_race_between_ctrlr_loss_timeout_and_pending_failover(void)
 	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
 }
 
+/* Test that when spdk_nvme_ctrlr_disconnect() returns -EBUSY during a
+ * reset-complete retry, the retry is spaced by reconnect_delay_sec via the
+ * ebusy_retry_timer — NOT retried every reactor tick (the old send_msg
+ * behavior, which was a no-op because resetting was already cleared, leaving
+ * the controller in limbo until the adminq re-drove at ~1 Hz).
+ *
+ * Also verifies that ctrlr_loss_timeout still accumulates and eventually
+ * destructs the controller despite the EBUSY retries.
+ */
+static void
+test_ebusy_retry_respects_reconnect_delay(void)
+{
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_ctrlr *nvme_ctrlr;
+	uint64_t reset_start_tsc;
+	int rc;
+
+	ut_init_trid(&trid);
+	TAILQ_INIT(&ctrlr.active_io_qpairs);
+
+	set_thread(0);
+
+	rc = nvme_ctrlr_create(&ctrlr, "nvme0", &trid, NULL);
+	CU_ASSERT(rc == 0);
+
+	nvme_ctrlr = nvme_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	nvme_ctrlr->opts.ctrlr_loss_timeout_sec = 3;
+	nvme_ctrlr->opts.reconnect_delay_sec = 2;
+
+	/* Start a reset that will fail (reconnect_poll_async returns -EIO). */
+	ctrlr.fail_reset = true;
+	/* Make spdk_nvme_ctrlr_disconnect() return -EBUSY to trigger the
+	 * ebusy_retry_timer path. */
+	ctrlr.fail_disconnect = true;
+
+	rc = bdev_nvme_reset_ctrlr(nvme_ctrlr);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(nvme_ctrlr->resetting == true);
+	CU_ASSERT(nvme_ctrlr->reset_start_tsc != 0);
+
+	reset_start_tsc = nvme_ctrlr->reset_start_tsc;
+
+	poll_threads();
+
+	/* Reset failed. bdev_nvme_reset_ctrlr_complete(false) clears resetting,
+	 * checks op_after_reset → OP_DELAYED_RECONNECT (ctrlr_loss not expired),
+	 * calls nvme_ctrlr_disconnect() which returns -EBUSY.
+	 *
+	 * The EBUSY path should:
+	 * - Set reconnect_is_delayed = true (gates the adminq re-drive)
+	 * - Register the ebusy_retry_timer (NOT the reconnect_delay_timer)
+	 * - NOT call spdk_thread_send_msg (no no-op deferred callback)
+	 */
+	CU_ASSERT(nvme_ctrlr->resetting == false);
+	CU_ASSERT(nvme_ctrlr->reconnect_is_delayed == true);
+	CU_ASSERT(nvme_ctrlr->ebusy_retry_timer != NULL);
+	CU_ASSERT(nvme_ctrlr->reconnect_delay_timer == NULL);
+	CU_ASSERT(nvme_ctrlr->reset_start_tsc == reset_start_tsc);
+
+	/* Poll a few times — the adminq should NOT re-drive failover because
+	 * reconnect_is_delayed is true. No new reset attempt. */
+	ctrlr.adminq.is_connected = false;
+	poll_thread_times(0, 3);
+
+	CU_ASSERT(nvme_ctrlr->reconnect_is_delayed == true);
+	CU_ASSERT(nvme_ctrlr->resetting == false);
+	CU_ASSERT(nvme_ctrlr->ebusy_retry_timer != NULL);
+
+	/* Advance time by reconnect_delay_sec (2s). The ebusy_retry_timer fires,
+	 * clears reconnect_is_delayed, and unregisters itself. The adminq poller
+	 * will then re-drive failover on its next poll. */
+	spdk_delay_us(2 * SPDK_SEC_TO_USEC);
+	poll_threads();
+
+	/* The timer fired, reconnect_is_delayed is cleared, and the adminq
+	 * re-drove failover → a new reset started (and failed again, since
+	 * fail_reset is still true). The new reset → complete(false) →
+	 * OP_DELAYED_RECONNECT → nvme_ctrlr_disconnect → EBUSY again →
+	 * new ebusy_retry_timer. */
+	CU_ASSERT(nvme_ctrlr->ebusy_retry_timer != NULL);
+	CU_ASSERT(nvme_ctrlr->reconnect_is_delayed == true);
+
+	/* ctrlr_loss_timeout (3s) has now elapsed since reset_start_tsc was set.
+	 * The next retry should destruct the controller. Advance time to ensure
+	 * the timeout fires. */
+	spdk_delay_us(2 * SPDK_SEC_TO_USEC);
+	poll_threads();
+
+	/* The controller should be marked for destruction (ctrlr_loss fired). */
+	CU_ASSERT(nvme_ctrlr->destruct == true);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
+}
+
+/* Test that bdev_nvme_start_reconnect_delay_timer cancels a pending
+ * ebusy_retry_timer when the normal reconnect path takes over (the qpair
+ * finished disconnecting on its own while the EBUSY timer was pending).
+ */
+static void
+test_start_reconnect_delay_cancels_ebusy_timer(void)
+{
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_ctrlr *nvme_ctrlr;
+	int rc;
+
+	ut_init_trid(&trid);
+	TAILQ_INIT(&ctrlr.active_io_qpairs);
+
+	set_thread(0);
+
+	rc = nvme_ctrlr_create(&ctrlr, "nvme0", &trid, NULL);
+	CU_ASSERT(rc == 0);
+
+	nvme_ctrlr = nvme_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	nvme_ctrlr->opts.reconnect_delay_sec = 2;
+
+	/* Simulate an EBUSY retry timer being pending. */
+	nvme_ctrlr->reconnect_is_delayed = true;
+	nvme_ctrlr->ebusy_retry_timer = SPDK_POLLER_REGISTER(
+		bdev_nvme_ebusy_retry_timer_expired, nvme_ctrlr,
+		2 * SPDK_SEC_TO_USEC);
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr->ebusy_retry_timer != NULL);
+
+	/* The normal reconnect path fires (qpair finished disconnecting).
+	 * bdev_nvme_start_reconnect_delay_timer must cancel the EBUSY timer
+	 * and take over with the reconnect_delay_timer. */
+	bdev_nvme_start_reconnect_delay_timer(nvme_ctrlr);
+
+	CU_ASSERT(nvme_ctrlr->ebusy_retry_timer == NULL);
+	CU_ASSERT(nvme_ctrlr->reconnect_delay_timer != NULL);
+	CU_ASSERT(nvme_ctrlr->reconnect_is_delayed == true);
+
+	/* Cleanup. */
+	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
+	nvme_ctrlr->reconnect_is_delayed = false;
+
+	free(nvme_ctrlr);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -8684,6 +8841,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_bdev_reset_abort_io);
 	CU_ADD_TEST(suite, test_race_between_clear_pending_resets_and_reset_ctrlr_complete);
 	CU_ADD_TEST(suite, test_race_between_ctrlr_loss_timeout_and_pending_failover);
+	CU_ADD_TEST(suite, test_ebusy_retry_respects_reconnect_delay);
+	CU_ADD_TEST(suite, test_start_reconnect_delay_cancels_ebusy_timer);
 
 	allocate_threads(3);
 	set_thread(0);
