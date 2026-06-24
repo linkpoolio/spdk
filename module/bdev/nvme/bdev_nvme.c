@@ -2034,7 +2034,7 @@ bdev_nvme_poll_adminq(void *arg)
 			bdev_nvme_change_adminq_poll_period(nvme_ctrlr,
 							    g_opts.nvme_adminq_poll_period_us);
 			disconnected_cb(nvme_ctrlr);
-		} else if (!nvme_ctrlr->resetting) {
+		} else if (!nvme_ctrlr->resetting && !nvme_ctrlr->reconnect_is_delayed) {
 			/*
 			 * Only initiate failover when no reset/failover is already
 			 * in flight. While resetting is true the reset state machine
@@ -2375,34 +2375,43 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb 
 		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
 
 		/* Disconnect fails (e.g. -EBUSY) while the underlying ctrlr is still
-		 * tearing down against a downed target. The previous fix (acb69478f)
-		 * deferred via spdk_thread_send_msg to break the stack recursion.
-		 * But the deferred callback is a no-op (resetting was already cleared
-		 * by bdev_nvme_reset_ctrlr_complete before calling us), so the
-		 * controller sits in limbo until the adminq poller re-drives failover
-		 * at ~1 Hz — a tight loop that wastes reactor cycles for the full
-		 * ctrlr_loss_timeout window (observed in production: 4 reactors at
-		 * 100% across every consumer IM during a storage-node restart).
+		 * tearing down against a downed target. There are two contexts:
 		 *
-		 * Instead, gate the retry with reconnect_delay_sec via a one-shot
-		 * timer. reconnect_is_delayed prevents the adminq poller from
-		 * re-driving failover during the delay; the adminq poller itself
-		 * stays running (NOT paused) so it can continue polling the qpair to
-		 * complete the underlying TCP teardown. After the delay, the timer
-		 * clears reconnect_is_delayed and the adminq re-drives naturally.
-		 * ctrlr_loss_timeout still accumulates (reset_start_tsc is never
-		 * reset on failure), so the controller is destructed after
-		 * ctrlr_loss_timeout_sec total regardless of how many EBUSY retries
-		 * occur.
+		 * 1) During the reset sequence (resetting == true): the reset state
+		 *    machine called nvme_ctrlr_disconnect() to tear down qpairs before
+		 *    reconnecting. We must complete the failed reset via
+		 *    bdev_nvme_reset_ctrlr_complete_failed (deferred via send_msg to
+		 *    break stack recursion — the original acb69478f fix).
+		 *
+		 * 2) During OP_DELAYED_RECONNECT (resetting == false):
+		 *    bdev_nvme_reset_ctrlr_complete already cleared resetting and
+		 *    called nvme_ctrlr_disconnect(cb_fn = start_reconnect_delay_timer).
+		 *    The old send_msg was a no-op here (guard: if (!resetting) return),
+		 *    so the controller sat in limbo until the adminq poller re-drove
+		 *    failover at ~1 Hz — a tight loop wasting reactor cycles for the
+		 *    full ctrlr_loss_timeout window (observed in production: 4 reactors
+		 *    at 100% across every consumer IM during a storage-node restart).
+		 *
+		 *    Instead, gate the retry with reconnect_delay_sec via a one-shot
+		 *    timer. reconnect_is_delayed prevents the adminq poller from
+		 *    re-driving failover during the delay; the adminq poller itself
+		 *    stays running (NOT paused) so it can continue polling the qpair
+		 *    to complete the underlying TCP teardown. After the delay, the
+		 *    timer clears reconnect_is_delayed and the adminq re-drives
+		 *    naturally. ctrlr_loss_timeout still accumulates (reset_start_tsc
+		 *    is never reset on failure), so the controller is destructed after
+		 *    ctrlr_loss_timeout_sec total regardless of EBUSY retry count.
 		 */
-		if (nvme_ctrlr->opts.reconnect_delay_sec != 0 &&
+		if (!nvme_ctrlr->resetting &&
+		    nvme_ctrlr->opts.reconnect_delay_sec != 0 &&
 		    nvme_ctrlr->ebusy_retry_timer == NULL) {
 			nvme_ctrlr->reconnect_is_delayed = true;
 			nvme_ctrlr->ebusy_retry_timer = SPDK_POLLER_REGISTER(
 				bdev_nvme_ebusy_retry_timer_expired, nvme_ctrlr,
 				nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
 		} else {
-			/* reconnect_delay_sec == 0: no delay to apply, fall back to the
+			/* resetting == true (reset sequence needs completion), or
+			 * reconnect_delay_sec == 0 (no delay to apply): fall back to the
 			 * immediate send_msg (the original recursion-break behavior). */
 			spdk_thread_send_msg(spdk_get_thread(),
 					     bdev_nvme_reset_ctrlr_complete_failed,
