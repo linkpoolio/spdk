@@ -37,6 +37,9 @@ DEFINE_STUB(spdk_bdev_flush_blocks, int, (struct spdk_bdev_desc *desc, struct sp
 DEFINE_STUB(spdk_bdev_unmap_blocks, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
 		void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_write_zeroes_blocks, int, (struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch, uint64_t offset_blocks, uint64_t num_blocks,
+		spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 
 int
 spdk_bdev_readv_blocks_ext(struct spdk_bdev_desc *desc,
@@ -66,6 +69,11 @@ void
 raid_bdev_fail_base_bdev(struct raid_base_bdev_info *base_info)
 {
 	base_info->is_failed = true;
+}
+
+struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev)
+{
+	return NULL;
 }
 
 static int

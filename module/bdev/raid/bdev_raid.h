@@ -7,11 +7,60 @@
 #define SPDK_BDEV_RAID_INTERNAL_H
 
 #include "spdk/bdev_module.h"
-#include "spdk/module/bdev/raid.h"
 #include "spdk/uuid.h"
 
 #define RAID_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB */
 
+enum raid_level {
+	INVALID_RAID_LEVEL	= -1,
+	RAID0			= 0,
+	RAID1			= 1,
+	RAID5F			= 95, /* 0x5f */
+	CONCAT			= 99,
+};
+
+/*
+ * Raid state describes the state of the raid. This raid bdev can be either in
+ * configured list or configuring list
+ */
+enum raid_bdev_state {
+	/* raid bdev is ready and is seen by upper layers */
+	RAID_BDEV_STATE_ONLINE,
+
+	/*
+	 * raid bdev is configuring, not all underlying bdevs are present.
+	 * And can't be seen by upper layers.
+	 */
+	RAID_BDEV_STATE_CONFIGURING,
+
+	/*
+	 * In offline state, raid bdev layer will complete all incoming commands without
+	 * submitting to underlying base nvme bdevs
+	 */
+	RAID_BDEV_STATE_OFFLINE,
+
+	/* raid bdev state max, new states should be added before this */
+	RAID_BDEV_STATE_MAX
+};
+
+/*
+ * The state of a base bdev
+ * When a bdev remove event or a base bdev fail message arrive to the raid, if delta map is enabled,
+ * the base bdev enter in faulty state for a defined timeout: the base bdev is removed from the
+ * raid but a delta bitmap is created and updated by every I/O write operations performed over the raid.
+ * Expired the timeout, the delta bitmap is deleted and the base bdev is removed from the faulty state,
+ * so no sign of this base bdev will remain in the raid.
+ */
+enum base_bdev_state {
+	/* The base bdev is healthy */
+	BASE_BDEV_STATE_NONE,
+
+	/* The faulty timer is running and the delta bitmap is being updated */
+	BASE_BDEV_STATE_FAULTY,
+
+	/* The faulty timer is running but the updating of the delta bitmap is stopped */
+	BASE_BDEV_STATE_FAULTY_STOPPED
+};
 
 enum raid_process_type {
 	RAID_PROCESS_NONE,
@@ -19,7 +68,18 @@ enum raid_process_type {
 	RAID_PROCESS_MAX
 };
 
-typedef void (*raid_bdev_action_cb)(void *ctx, int rc);
+enum raid_bdev_update_state {
+	/* No ongoing updates on raid base bdevs */
+	RAID_BDEV_UPDATE_NONE,
+
+	/* A base bdev removal is ongoing */
+	RAID_BDEV_UPDATE_REMOVING,
+
+	/* A base bdev growth is ongoing */
+	RAID_BDEV_UPDATE_GROWING,
+};
+
+typedef void (*raid_base_bdev_cb)(void *ctx, int status);
 
 /*
  * raid_base_bdev_info contains information for the base bdevs which are part of some
@@ -56,7 +116,7 @@ struct raid_base_bdev_info {
 	bool			remove_scheduled;
 
 	/* callback for base bdev removal */
-	raid_bdev_action_cb	remove_cb;
+	raid_base_bdev_cb	remove_cb;
 
 	/* context of the callback */
 	void			*remove_cb_ctx;
@@ -77,10 +137,33 @@ struct raid_base_bdev_info {
 	bool			is_failed;
 
 	/* callback for base bdev configuration */
-	raid_bdev_action_cb	configure_cb;
+	raid_base_bdev_cb	configure_cb;
 
 	/* context of the callback */
 	void			*configure_cb_ctx;
+
+	/* Set to true to skip the start of the rebuild process when adding to an online raid */
+	bool			skip_rebuild;
+
+	/* The state of the base bdev */
+	enum base_bdev_state	state;
+
+	/*
+	 * When the base bdev is in faulty state, this bitmap records all the regions that have
+	 * been modified by a write operation. Region size is equal to bdev optimal_io_boundary.
+	 * Delta bitmap can be retrieved with a RPC to speed up the rebuild of the base bdev in case
+	 * it come back online before being declared definitely dead and delta_bitmap deleted.
+	 */
+	struct spdk_bit_array	*delta_bitmap;
+
+	/* The poller starts when the base bdev becomes faulty and the delta_bitmap is created.
+	 * When the poller expires, base bdev is definitely removed from the raid and the
+	 * delta bitmap is deleted.
+	 */
+	struct spdk_poller	*poller;
+
+	/* The ticks passed since the start of the poller */
+	uint64_t		poller_start_ticks;
 };
 
 struct raid_bdev_io;
@@ -145,6 +228,8 @@ struct raid_bdev_process_request {
 	TAILQ_ENTRY(raid_bdev_process_request) link;
 };
 
+typedef void (*raid_bdev_configure_cb)(void *cb_ctx, int rc);
+
 /*
  * raid_bdev is the single entity structure which contains SPDK block device
  * and the information related to any raid bdev either configured or
@@ -173,7 +258,7 @@ struct raid_bdev {
 	uint32_t			strip_size_shift;
 
 	/* state of raid bdev */
-	enum spdk_bdev_raid_state	state;
+	enum raid_bdev_state		state;
 
 	/* number of base bdevs comprising raid bdev  */
 	uint8_t				num_base_bdevs;
@@ -191,7 +276,7 @@ struct raid_bdev {
 	uint8_t				min_base_bdevs_operational;
 
 	/* Raid Level of this raid bdev */
-	enum spdk_bdev_raid_level	level;
+	enum raid_level			level;
 
 	/* Set to true if destroy of this raid bdev is started. */
 	bool				destroy_started;
@@ -206,23 +291,22 @@ struct raid_bdev {
 	bool				superblock_enabled;
 	struct raid_bdev_superblock	*sb;
 
-	/* Superblock buffers used for I/O */
+	/* Superblock buffer used for I/O */
 	void				*sb_io_buf;
 	uint32_t			sb_io_buf_size;
-	void				*sb_io_md_buf;
-	uint32_t			sb_io_md_buf_size;
 
 	/* Raid bdev background process, e.g. rebuild */
 	struct raid_bdev_process	*process;
 
 	/* Callback and context for raid_bdev configuration */
-	raid_bdev_action_cb		configure_cb;
+	raid_bdev_configure_cb		configure_cb;
 	void				*configure_cb_ctx;
-	int				configure_cb_status;
 
-	/* Callback and context for raid_bdev destruction */
-	raid_bdev_action_cb		destroy_cb;
-	void				*destroy_cb_ctx;
+	/* A flag to indicate that an operation to add/remove a base bdev is in progress */
+	enum raid_bdev_update_state	base_bdev_updating;
+
+	/* A flag to enable the recording of a delta bitmap for faulty base bdevs */
+	bool				delta_bitmap_enabled;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -235,28 +319,40 @@ TAILQ_HEAD(raid_all_tailq, raid_bdev);
 
 extern struct raid_all_tailq		g_raid_bdev_list;
 
+typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
+
 int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
-		     char **base_bdev_names, enum spdk_bdev_raid_level level, bool superblock_enabled,
-		     const struct spdk_uuid *uuid, raid_bdev_action_cb cb_fn, void *cb_ctx);
-void raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_action_cb cb_fn,
-		      void *cb_ctx);
+		     enum raid_level level, bool superblock, const struct spdk_uuid *uuid,
+		     bool delta_bitmap_enabled, struct raid_bdev **raid_bdev_out);
+void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
 int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
-			    raid_bdev_action_cb cb_fn, void *cb_ctx);
+			    raid_base_bdev_cb cb_fn, void *cb_ctx);
 struct raid_bdev *raid_bdev_find_by_name(const char *name);
-enum spdk_bdev_raid_level raid_bdev_str_to_level(const char *str);
-const char *raid_bdev_level_to_str(enum spdk_bdev_raid_level level);
-const char *raid_bdev_state_to_str(enum spdk_bdev_raid_state state);
+enum raid_level raid_bdev_str_to_level(const char *str);
+const char *raid_bdev_level_to_str(enum raid_level level);
+enum raid_bdev_state raid_bdev_str_to_state(const char *str);
+const char *raid_bdev_state_to_str(enum raid_bdev_state state);
 const char *raid_bdev_process_to_str(enum raid_process_type value);
 void raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ctx *w);
-int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb cb_fn,
-			       void *cb_ctx);
+int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_base_bdev_cb cb_fn, void *cb_ctx);
+int raid_bdev_grow_base_bdev(struct raid_bdev *raid_bdev, char *base_bdev_name,
+			     raid_bdev_destruct_cb cb_fn, void *cb_arg);
+struct raid_base_bdev_info *raid_bdev_find_base_info_by_bdev(struct spdk_bdev *base_bdev);
+struct raid_base_bdev_info *raid_bdev_find_faulty_base_info_by_name(char *base_bdev_name);
+struct spdk_bit_array *raid_bdev_get_base_bdev_delta_bitmap(char *base_bdev_name);
+int raid_bdev_stop_base_bdev_delta_bitmap(char *base_bdev_name, raid_bdev_destruct_cb cb_fn,
+		void *cb_arg);
+int raid_bdev_clear_base_bdev_faulty_state(char *base_bdev_name, raid_bdev_destruct_cb cb_fn,
+		void *cb_arg);
+uint64_t raid_bdev_region_size_base_bdev_delta_bitmap(char *base_bdev_name);
+const char *raid_bdev_delta_bitmap_state(enum base_bdev_state value);
 
 /*
  * RAID module descriptor
  */
 struct raid_bdev_module {
 	/* RAID level implemented by this module */
-	enum spdk_bdev_raid_level level;
+	enum raid_level level;
 
 	/* Minimum required number of base bdevs. Must be > 0. */
 	uint8_t base_bdevs_min;
@@ -324,6 +420,16 @@ struct raid_bdev_module {
 				      struct raid_bdev_io_channel *raid_ch);
 
 	TAILQ_ENTRY(raid_bdev_module) link;
+
+	/* Handle for module specific operations needed for raid grow */
+	bool (*channel_grow_base_bdev)(struct raid_bdev *raid_bdev,
+				       struct raid_bdev_io_channel *raid_ch);
+
+	/* Handle for module specific operations needed to handle faulty base bdev */
+	int (*channel_faulty_base_bdev)(struct raid_base_bdev_info *base_info,
+					struct raid_bdev_io_channel *raid_ch,
+					enum base_bdev_state newState);
+
 };
 
 void raid_bdev_module_list_add(struct raid_bdev_module *raid_module);
@@ -349,12 +455,20 @@ struct spdk_io_channel *raid_bdev_channel_get_base_channel(struct raid_bdev_io_c
 void *raid_bdev_channel_get_module_ctx(struct raid_bdev_io_channel *raid_ch);
 struct raid_base_bdev_info *raid_bdev_channel_get_base_info(struct raid_bdev_io_channel *raid_ch,
 		struct spdk_bdev *base_bdev);
+uint8_t raid_bdev_channel_get_num_channels(struct raid_bdev_io_channel *raid_ch);
 void raid_bdev_process_request_complete(struct raid_bdev_process_request *process_req, int status);
 void raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel *raid_ch,
 		       enum spdk_bdev_io_type type, uint64_t offset_blocks,
 		       uint64_t num_blocks, struct iovec *iovs, int iovcnt, void *md_buf,
 		       struct spdk_memory_domain *memory_domain, void *memory_domain_ctx);
 void raid_bdev_fail_base_bdev(struct raid_base_bdev_info *base_info);
+
+/* RAID delta map update message and data */
+struct raid_bdev_io_failed {
+	struct raid_base_bdev_info *base_info;
+	uint64_t offset_blocks;
+	uint64_t num_blocks;
+};
 
 static inline uint8_t
 raid_bdev_base_bdev_slot(struct raid_base_bdev_info *base_info)
@@ -368,6 +482,12 @@ raid_bdev_io_set_default_status(struct raid_bdev_io *raid_io, enum spdk_bdev_io_
 	assert(raid_io->base_bdev_io_submitted == 0);
 	raid_io->base_bdev_io_status = status;
 	raid_io->base_bdev_io_status_default = status;
+}
+
+static inline uint32_t
+raid_bdev_delta_bitmap_region_blocks_number(struct spdk_bdev *bdev_raid)
+{
+	return bdev_raid->blockcnt / bdev_raid->optimal_io_boundary;
 }
 
 int raid_bdev_remap_dix_reftag(void *md_buf, uint64_t num_blocks,
@@ -437,6 +557,24 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 				      num_blocks, cb, cb_arg);
 }
 
+/**
+ * Raid bdev I/O wrapper for spdk_bdev_write_zeroes_blocks function. WRITE_ZEROES
+ * is dispatched as a null-payload op to base bdevs that support it natively
+ * (NVMe Write Zeroes, AIO fallocate(PUNCH_HOLE), malloc memset). Without this
+ * forwarding the bdev layer falls back to a buffered-zero emulation that ships
+ * a full zero buffer per op — for large clusters this is the dominant cost on
+ * thin-lvol cluster allocation (blob_allocate_and_copy_cluster).
+ */
+static inline int
+raid_bdev_write_zeroes_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
+			      uint64_t offset_blocks, uint64_t num_blocks,
+			      spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	return spdk_bdev_write_zeroes_blocks(base_info->desc, ch,
+					     base_info->data_offset + offset_blocks,
+					     num_blocks, cb, cb_arg);
+}
+
 /*
  * Definitions related to raid bdev superblock
  */
@@ -450,7 +588,8 @@ enum raid_bdev_sb_base_bdev_state {
 	RAID_SB_BASE_BDEV_MISSING	= 0,
 	RAID_SB_BASE_BDEV_CONFIGURED	= 1,
 	RAID_SB_BASE_BDEV_FAILED	= 2,
-	RAID_SB_BASE_BDEV_SPARE		= 3,
+	RAID_SB_BASE_BDEV_SPARE	= 3,
+	RAID_SB_BASE_BDEV_REMOVED	= 4,
 };
 
 struct raid_bdev_sb_base_bdev {
@@ -504,8 +643,10 @@ struct raid_bdev_superblock {
 	uint64_t		seq_number;
 	/* number of raid base devices */
 	uint8_t			num_base_bdevs;
+	/*  */
+	bool			delta_bitmap_enabled;
 
-	uint8_t			reserved[118];
+	uint8_t			reserved[116];
 
 	/* size of the base bdevs array */
 	uint8_t			base_bdevs_size;
@@ -526,8 +667,6 @@ int raid_bdev_alloc_superblock(struct raid_bdev *raid_bdev, uint32_t block_size)
 void raid_bdev_free_superblock(struct raid_bdev *raid_bdev);
 void raid_bdev_init_superblock(struct raid_bdev *raid_bdev);
 void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,
-				void *cb_ctx);
-void raid_bdev_clear_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,
 				void *cb_ctx);
 int raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 					raid_bdev_load_sb_cb cb, void *cb_ctx);

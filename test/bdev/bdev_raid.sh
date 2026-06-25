@@ -1147,61 +1147,218 @@ function raid_resize_data_offset_test() {
 	return 0
 }
 
-function raid_delete_clear_sb_test() {
+function raid_grow_test() {
 	local raid_level=$1
 	local num_base_bdevs=$2
+	local superblock=$3
+	local background_io=$4
 	local base_bdevs=($(for ((i = 1; i <= num_base_bdevs; i++)); do echo BaseBdev$i; done))
-	local raid_bdev_name="raid_bdev"
-	local strip_size
+	local raid_bdev_name="raid_bdev1"
+	local strip_size=0
 	local create_arg
+	local raid_bdev_size
+	local data_offset
 
 	if [ $raid_level != "raid1" ]; then
-		strip_size=64
-		create_arg+=" -z $strip_size"
-	else
-		strip_size=0
+		echo "skipping grow test for level $raid_level"
+		return 1
 	fi
 
-	"$rootdir/test/app/bdev_svc/bdev_svc" -L bdev_raid &
+	if [ $superblock = true ]; then
+		create_arg+=" -s"
+	fi
+
+	"$rootdir/build/examples/bdevperf" -T $raid_bdev_name -t 60 -w randrw -M 50 -o 3M -q 2 -U -z -L bdev_raid &
 	raid_pid=$!
 	waitforlisten $raid_pid
 
 	# Create base bdevs
 	for bdev in "${base_bdevs[@]}"; do
-		$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b ${bdev}_malloc
-		$rpc_py bdev_passthru_create -b ${bdev}_malloc -p $bdev
+		if [ $superblock = true ]; then
+			$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b ${bdev}_malloc
+			$rpc_py bdev_passthru_create -b ${bdev}_malloc -p $bdev
+		else
+			$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b $bdev
+		fi
 	done
 
-	# Create RAID bdev with superblock
-	$rpc_py bdev_raid_create $create_arg -r $raid_level -b "'${base_bdevs[*]}'" -n $raid_bdev_name -s
+	# Create spare bdev
+	if [ $superblock = true ]; then
+		$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b "spare_malloc"
+		$rpc_py bdev_passthru_create -b "spare_malloc" -p "spare"
+	else
+		$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b "spare"
+	fi
+
+	# Create RAID bdev
+	$rpc_py bdev_raid_create $create_arg -r $raid_level -b "'${base_bdevs[*]}'" -n $raid_bdev_name
+	echo $raid_bdev_name $raid_level $strip_size $num_base_bdevs
 	verify_raid_bdev_state $raid_bdev_name "online" $raid_level $strip_size $num_base_bdevs
 
-	# Delete RAID bdev with clear_sb=true (should clear superblock)
-	$rpc_py bdev_raid_delete $raid_bdev_name --clear-sb
+	# Get RAID bdev's size
+	raid_bdev_size=$($rpc_py bdev_get_bdevs -b $raid_bdev_name | jq -r '.[].num_blocks')
 
-	# Recreate the base bdevs - raid bdev should NOT start from superblock
-	for bdev in "${base_bdevs[@]}"; do
-		$rpc_py bdev_passthru_delete $bdev
-		$rpc_py bdev_passthru_create -b ${bdev}_malloc -p $bdev
-	done
-	$rpc_py bdev_wait_for_examine
-	[ -z $($rpc_py bdev_raid_get_bdevs all | jq '.[]') ]
+	# Get base bdev's data offset
+	data_offset=$($rpc_py bdev_raid_get_bdevs all | jq -r '.[].base_bdevs_list[0].data_offset')
 
-	# Try to create the RAID with an invalid name
-	NOT $rpc_py bdev_raid_create $create_arg -r $raid_level -b "'${base_bdevs[*]}'" -n "${base_bdevs[0]}" -s
-	[ -z $($rpc_py bdev_raid_get_bdevs all | jq '.[]') ]
+	if [ $background_io = true ]; then
+		# Start user I/O
+		"$rootdir/examples/bdev/bdevperf/bdevperf.py" perform_tests &
+		sleep 1
+	else
+		# Write random data to the first half of RAID bdev
+		nbd_start_disks $DEFAULT_RPC_ADDR $raid_bdev_name /dev/nbd0
+		dd if=/dev/urandom of=/dev/nbd0 bs=$base_blocklen count=$((raid_bdev_size / 2)) oflag=direct
+		nbd_stop_disks $DEFAULT_RPC_ADDR /dev/nbd0
+	fi
 
-	# Create RAID bdev again
-	$rpc_py bdev_raid_create $create_arg -r $raid_level -b "'${base_bdevs[*]}'" -n $raid_bdev_name -s
-	verify_raid_bdev_state $raid_bdev_name "online" $raid_level $strip_size $num_base_bdevs
+	local num_base_bdevs_operational=$num_base_bdevs
+	if [ $raid_level = "raid1" ] && [ $num_base_bdevs -gt 2 ]; then
+		# Remove one base bdev
+		$rpc_py bdev_raid_remove_base_bdev ${base_bdevs[2]}
+
+		# Ignore this bdev later when comparing data
+		base_bdevs[2]=""
+		((num_base_bdevs_operational--))
+
+		# Check RAID status
+		verify_raid_bdev_state $raid_bdev_name "online" $raid_level $strip_size $num_base_bdevs_operational
+	fi
+
+	# Grow raid with one new base bdev
+	$rpc_py bdev_raid_grow_base_bdev $raid_bdev_name "spare"
+	((num_base_bdevs_operational++))
+
+	# Check RAID status
+	verify_raid_bdev_state $raid_bdev_name "online" $raid_level $strip_size $num_base_bdevs_operational
+
+	if [ $background_io = false ]; then
+		# Write random data to the second half of RAID bdev
+		nbd_start_disks $DEFAULT_RPC_ADDR $raid_bdev_name /dev/nbd0
+		dd if=/dev/urandom of=/dev/nbd0 bs=$base_blocklen count=$((raid_bdev_size / 2)) seek=$((raid_bdev_size / 2)) oflag=direct
+		nbd_stop_disks $DEFAULT_RPC_ADDR /dev/nbd0
+	fi
+
+	# Stop the RAID bdev
+	$rpc_py bdev_raid_delete $raid_bdev_name
+	[[ $($rpc_py bdev_raid_get_bdevs all | jq 'length') == 0 ]]
+
+	if [ $background_io = false ]; then
+		# Compare second half data on the spare and other base bdevs
+		nbd_start_disks $DEFAULT_RPC_ADDR "spare" "/dev/nbd0"
+		for bdev in "${base_bdevs[@]:1}"; do
+			if [ -z "$bdev" ]; then
+				continue
+			fi
+			nbd_start_disks $DEFAULT_RPC_ADDR $bdev "/dev/nbd1"
+			cmp -i $((data_offset * base_blocklen + raid_bdev_size * base_blocklen / 2)) /dev/nbd0 /dev/nbd1
+			nbd_stop_disks $DEFAULT_RPC_ADDR "/dev/nbd1"
+		done
+		nbd_stop_disks $DEFAULT_RPC_ADDR "/dev/nbd0"
+	fi
+
+	if [ $superblock = true ]; then
+		# Remove the passthru base bdevs, then re-add them to assemble the raid bdev again
+		for bdev in "${base_bdevs[@]}"; do
+			if [ -z "$bdev" ]; then
+				continue
+			fi
+			$rpc_py bdev_passthru_delete $bdev
+			$rpc_py bdev_passthru_create -b ${bdev}_malloc -p $bdev
+		done
+		$rpc_py bdev_passthru_delete "spare"
+		$rpc_py bdev_passthru_create -b "spare_malloc" -p "spare"
+
+		verify_raid_bdev_state $raid_bdev_name "online" $raid_level $strip_size $num_base_bdevs_operational
+		[[ $($rpc_py bdev_raid_get_bdevs all | jq -r '.[].base_bdevs_list[2].name') == "spare" ]]
+	fi
 
 	killprocess $raid_pid
+
+	return 0
+}
+
+function raid_delta_bitmap() {
+	local num_base_bdevs=$1
+	local background_io=$2
+	local base_bdevs=($(for ((i = 1; i <= num_base_bdevs; i++)); do echo BaseBdev$i; done))
+	local raid_bdev_name="raid_bdev1"
+	local strip_size=0
+	local raid_bdev_size
+	local data_offset
+
+	if [ $num_base_bdevs -eq 1 ]; then
+		echo "skipping delta bitmap test because only 1 base bdev provided"
+		return 1
+	fi
+
+	"$rootdir/build/examples/bdevperf" -T $raid_bdev_name -t 60 -w randrw -M 50 -o 3M -q 2 -U -z -L bdev_raid &
+	raid_pid=$!
+	waitforlisten $raid_pid
+
+	# Create base bdevs
+	for bdev in "${base_bdevs[@]}"; do
+		$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b $bdev -o 8192
+	done
+
+	# Create RAID bdev
+	$rpc_py bdev_raid_create -r raid1 -b "'${base_bdevs[*]}'" -n $raid_bdev_name -d
+	echo $raid_bdev_name raid1 $strip_size $num_base_bdevs
+	verify_raid_bdev_state $raid_bdev_name "online" raid1 $strip_size $num_base_bdevs
+
+	# Get RAID bdev's size
+	raid_bdev_size=$($rpc_py bdev_get_bdevs -b $raid_bdev_name | jq -r '.[].num_blocks')
+
+	# Get base bdev's data offset
+	data_offset=$($rpc_py bdev_raid_get_bdevs all | jq -r '.[].base_bdevs_list[0].data_offset')
+
+	if [ $background_io = true ]; then
+		# Start user I/O
+		"$rootdir/examples/bdev/bdevperf/bdevperf.py" perform_tests &
+	fi
+
+	local num_base_bdevs_operational=$num_base_bdevs
+
+	# Remove one base bdev
+	$rpc_py bdev_malloc_delete ${base_bdevs[0]}
+	((num_base_bdevs_operational--))
+
+	# Check RAID status
+	verify_raid_bdev_state $raid_bdev_name "online" raid1 $strip_size $num_base_bdevs_operational
+
+	if [ $background_io = false ]; then
+		# Write random data to the second half of RAID bdev
+		nbd_start_disks $DEFAULT_RPC_ADDR $raid_bdev_name /dev/nbd0
+		dd if=/dev/urandom of=/dev/nbd0 bs=$base_blocklen count=$((raid_bdev_size / 2)) seek=$((raid_bdev_size / 2)) oflag=direct
+		nbd_stop_disks $DEFAULT_RPC_ADDR /dev/nbd0
+	fi
+
+	# Stop the delta bitmap
+	$rpc_py bdev_raid_stop_base_bdev_delta_bitmap ${base_bdevs[0]}
+
+	# Get the delta bitmap
+	delta_bitmap=$($rpc_py bdev_raid_get_base_bdev_delta_bitmap ${base_bdevs[0]} | jq -r '.delta_bitmap')
+
+	if [ $background_io = false ]; then
+		# Check the delta bitmap
+		[[ "$delta_bitmap" == "8A==" ]]
+	fi
+
+	# Stop the RAID bdev
+	$rpc_py bdev_raid_delete $raid_bdev_name
+	[[ $($rpc_py bdev_raid_get_bdevs all | jq 'length') == 0 ]]
+
+	killprocess $raid_pid
+
+	return 0
 }
 
 mkdir -p "$tmp_dir"
 trap 'cleanup; exit 1' EXIT
 
 base_blocklen=512
+
+run_test "raid_io_resource_dependence" raid_io_resource_dependence
 
 run_test "raid1_resize_data_offset_test" raid_resize_data_offset_test
 
@@ -1211,7 +1368,6 @@ run_test "raid1_resize_superblock_test" raid_resize_superblock_test 1
 if [ $(uname -s) = Linux ] && modprobe -n nbd; then
 	has_nbd=true
 	modprobe nbd
-	run_test "raid_io_resource_dependence" raid_io_resource_dependence
 	run_test "raid_unmap_function_test_raid0" raid_unmap_function_test raid0
 	run_test "raid_unmap_function_test_concat" raid_unmap_function_test concat
 	run_test "raid_unmap_function_test_raid1" raid_unmap_function_test raid1
@@ -1236,6 +1392,12 @@ if [ "$has_nbd" = true ]; then
 		run_test "raid_rebuild_test_sb" raid_rebuild_test raid1 $n true false true
 		run_test "raid_rebuild_test_io" raid_rebuild_test raid1 $n false true true
 		run_test "raid_rebuild_test_sb_io" raid_rebuild_test raid1 $n true true true
+		run_test "raid_grow_test" raid_grow_test raid1 $n false false
+		run_test "raid_grow_test" raid_grow_test raid1 $n true false
+		run_test "raid_grow_test" raid_grow_test raid1 $n false true
+		run_test "raid_grow_test" raid_grow_test raid1 $n true true
+		run_test "raid_delta_bitmap" raid_delta_bitmap $n false
+		run_test "raid_delta_bitmap" raid_delta_bitmap $n true
 	done
 fi
 
@@ -1248,9 +1410,6 @@ for n in {3..4}; do
 		run_test "raid5f_rebuild_test_sb" raid_rebuild_test raid5f $n true false true
 	fi
 done
-
-run_test "raid1_delete_clear_sb_test" raid_delete_clear_sb_test raid1 2
-run_test "raid5f_delete_clear_sb_test" raid_delete_clear_sb_test raid5f 3
 
 base_blocklen=4096
 
