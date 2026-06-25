@@ -16,6 +16,8 @@
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 512
 
 #define LVOL_NAME "name"
+#define LVOL_CREATION_TIME "creation_time"
+#define LVOL_SNAPSHOT_CHECKSUM "checksum"
 
 SPDK_LOG_REGISTER_COMPONENT(lvol)
 
@@ -112,8 +114,13 @@ lvol_alloc(struct spdk_lvol_store *lvs, const char *name, bool thin_provision,
 	spdk_uuid_generate(&lvol->uuid);
 	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
 	spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->uuid_str), &lvol->uuid);
+	spdk_current_utc_time_rfc3339(lvol->creation_time, sizeof(lvol->creation_time));
 
 	TAILQ_INSERT_TAIL(&lvs->pending_lvols, lvol, link);
+
+	spdk_spin_init(&lvol->spinlock);
+	TAILQ_INIT(&lvol->freezed_ranges);
+	TAILQ_INIT(&lvol->pending_freezed_ranges);
 
 	return lvol;
 }
@@ -121,7 +128,64 @@ lvol_alloc(struct spdk_lvol_store *lvs, const char *name, bool thin_provision,
 static void
 lvol_free(struct spdk_lvol *lvol)
 {
+	if (lvol != NULL) {
+		spdk_spin_destroy(&lvol->spinlock);
+	}
+
 	free(lvol);
+}
+
+static void
+lvol_free_xattrs_list(char **xattrs)
+{
+	char **entry;
+
+	if (xattrs) {
+		for (entry = xattrs; *entry; entry++) {
+			free(*entry);
+		}
+		free(xattrs);
+	}
+}
+
+static char **
+lvol_dup_xattr_list(const char *const *xattrs, size_t xattr_num)
+{
+	size_t count;
+	char **copy;
+
+	if (!xattrs) {
+		return NULL;
+	}
+
+	copy = calloc(xattr_num + 1, sizeof(*copy));
+	if (!copy) {
+		return NULL;
+	}
+
+	for (count = 0; count < xattr_num; count++) {
+		if (!(copy[count] = strdup(xattrs[count]))) {
+			lvol_free_xattrs_list(copy);
+			return NULL;
+		}
+	}
+
+	return copy;
+}
+
+static bool
+lvol_check_exteranl_xattr_name(const char *name)
+{
+	char *internal_xattr_names[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME, LVOL_SNAPSHOT_CHECKSUM};
+	size_t i;
+
+	for (i = 0; i < SPDK_COUNTOF(internal_xattr_names); i++) {
+		if (strcmp(name, internal_xattr_names[i]) == 0) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 static void
@@ -275,6 +339,15 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	}
 
 	snprintf(lvol->name, sizeof(lvol->name), "%s", attr);
+
+	rc = spdk_blob_get_xattr_value(blob, "creation_time", (const void **)&attr, &value_len);
+	if (rc == 0 && value_len <= SPDK_CREATION_TIME_MAX) {
+		snprintf(lvol->creation_time, sizeof(lvol->creation_time), "%s", attr);
+	}
+
+	spdk_spin_init(&lvol->spinlock);
+	TAILQ_INIT(&lvol->freezed_ranges);
+	TAILQ_INIT(&lvol->pending_freezed_ranges);
 
 	TAILQ_INSERT_TAIL(&lvs->lvols, lvol, link);
 
@@ -651,7 +724,7 @@ lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst)
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 92, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 284, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -961,7 +1034,7 @@ spdk_lvs_destroy(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 	}
 
 	TAILQ_FOREACH_SAFE(iter_lvol, &lvs->lvols, link, tmp) {
-		free(iter_lvol);
+		lvol_free(iter_lvol);
 	}
 
 	lvs_req = calloc(1, sizeof(*lvs_req));
@@ -1018,6 +1091,12 @@ lvol_delete_blob_cb(void *cb_arg, int lvolerrno)
 	struct spdk_lvol *clone_lvol = req->clone_lvol;
 
 	if (lvolerrno < 0) {
+		if (lvolerrno == -EBUSY) {
+			SPDK_ERRLOG("Error %d deleting lvol %s\n", lvolerrno, lvol->name);
+			req->cb_fn(req->cb_arg, lvolerrno);
+			free(req);
+			return;
+		}
 		SPDK_ERRLOG("Could not remove blob on lvol gracefully - forced removal\n");
 	} else {
 		SPDK_INFOLOG(lvol, "Lvol %s deleted\n", lvol->unique_id);
@@ -1055,6 +1134,8 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 
 	if (lvolerrno < 0) {
 		lvol_free(lvol);
+		lvol_free_xattrs_list(req->xattrs_external);
+		lvol_free_xattrs_list(req->xattr_names);
 		req->cb_fn(req->cb_arg, NULL, lvolerrno);
 		free(req);
 		return;
@@ -1067,6 +1148,8 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 
 	lvol->ref_count++;
 
+	lvol_free_xattrs_list(req->xattrs_external);
+	lvol_free_xattrs_list(req->xattr_names);
 	assert(req->cb_fn != NULL);
 	req->cb_fn(req->cb_arg, req->lvol, lvolerrno);
 	free(req);
@@ -1082,6 +1165,8 @@ lvol_create_cb(void *cb_arg, spdk_blob_id blobid, int lvolerrno)
 	if (lvolerrno < 0) {
 		TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 		lvol_free(req->lvol);
+		lvol_free_xattrs_list(req->xattrs_external);
+		lvol_free_xattrs_list(req->xattr_names);
 		assert(req->cb_fn != NULL);
 		req->cb_fn(req->cb_arg, NULL, lvolerrno);
 		free(req);
@@ -1133,6 +1218,12 @@ lvol_get_xattr_value(void *xattr_ctx, const char *name,
 		*value_len = sizeof(lvol->uuid_str);
 		return;
 	}
+	if (!strcmp(LVOL_CREATION_TIME, name)) {
+		*value = lvol->creation_time;
+		*value_len = sizeof(lvol->creation_time);
+		return;
+	}
+
 	*value = NULL;
 	*value_len = 0;
 }
@@ -1178,7 +1269,7 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	struct spdk_blob_store *bs;
 	struct spdk_lvol *lvol;
 	struct spdk_blob_opts opts;
-	char *xattr_names[] = {LVOL_NAME, "uuid"};
+	char *xattr_names[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME};
 	int rc;
 
 	if (lvs == NULL) {
@@ -1233,7 +1324,7 @@ spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t siz
 	struct spdk_lvol *lvol;
 	struct spdk_blob_opts opts;
 	uint64_t cluster_sz;
-	char *xattr_names[] = {LVOL_NAME, "uuid"};
+	char *xattr_names[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME};
 	int rc;
 
 	if (lvs == NULL) {
@@ -1297,7 +1388,7 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	struct spdk_blob *origblob;
 	struct spdk_lvol_with_handle_req *req;
 	struct spdk_blob_xattr_opts snapshot_xattrs;
-	char *xattr_names[] = {LVOL_NAME, "uuid"};
+	char *xattr_names[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME};
 	int rc;
 
 	if (origlvol == NULL) {
@@ -1349,6 +1440,191 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 				lvol_create_cb, req);
 }
 
+struct xattrs_ctx {
+	struct spdk_lvol *newlvol;
+	char **xattrs_external;
+};
+
+static void
+lvol_get_xattr_value_ext(void *xattr_ctx, const char *name,
+			 const void **value, size_t *value_len)
+{
+	struct xattrs_ctx *ctx = xattr_ctx;
+	size_t i;
+
+	lvol_get_xattr_value(ctx->newlvol, name, value, value_len);
+
+	if (*value == NULL || *value_len == 0) {
+		/* Search for external xattr */
+		for (i = 0; ctx->xattrs_external[i]; i++) {
+			/* Skip xattrs value, we search xattr names, which are in even positions */
+			if (i % 2 != 0) {
+				continue;
+			}
+
+			if (strcmp(name, ctx->xattrs_external[i]) == 0) {
+				*value = ctx->xattrs_external[i + 1];
+				*value_len = strlen(ctx->xattrs_external[i + 1]) + 1;
+				return;
+			}
+		}
+
+		*value = NULL;
+		*value_len = 0;
+	}
+}
+
+/*
+ * Create a list of xattr names that is the union of the internal xattr names list and the
+ * external xattr name,value list.
+ */
+static char **
+lvol_create_xattrs_names(const char *const *xattr_internal, const char *const *xattr_external,
+			 size_t num_internal, size_t num_external)
+{
+	size_t full_i, ext_i;
+	char **full_list;
+
+	full_list = calloc(num_internal + num_external, sizeof(*full_list));
+	if (!full_list) {
+		return NULL;
+	}
+
+	for (full_i = 0; full_i < num_internal; full_i++) {
+		if (!(full_list[full_i] = strdup(xattr_internal[full_i]))) {
+			lvol_free_xattrs_list(full_list);
+			return NULL;
+		}
+	}
+
+	for (ext_i = 0; ext_i < num_external; ext_i++) {
+		/* Skip xattrs value, we need only xattr names, which are in even positions */
+		if (ext_i % 2 != 0) {
+			continue;
+		}
+
+		if (!(full_list[full_i] = strdup(xattr_external[ext_i]))) {
+			lvol_free_xattrs_list(full_list);
+			return NULL;
+		}
+		full_i++;
+	}
+
+	return full_list;
+}
+
+void
+spdk_lvol_create_snapshot_with_xattrs(struct spdk_lvol *origlvol, const char *snapshot_name,
+				      const char *const *xattrs_external, size_t xattrs_external_num,
+				      spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *newlvol;
+	struct spdk_blob *origblob;
+	struct spdk_lvol_with_handle_req *req;
+	struct spdk_blob_xattr_opts snapshot_xattrs;
+	struct xattrs_ctx xattr_ctx;
+	char **xattr_names;
+	char **xattr_external_dup;
+	char *xattr_names_internal[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME};
+	int rc;
+	size_t i;
+
+	if (origlvol == NULL) {
+		SPDK_INFOLOG(lvol, "Lvol not provided.\n");
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	if (xattrs_external == NULL) {
+		SPDK_WARNLOG("Xattr not provided.\n");
+		return spdk_lvol_create_snapshot(origlvol, snapshot_name, cb_fn, cb_arg);
+	}
+
+	if (xattrs_external_num % 2 != 0) {
+		SPDK_ERRLOG("Xattr list must contain couples of key-value\n");
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	/*
+	 * Elements inside xattrs_external are as the following example:
+	 * [xattr1_name, xattr1_value, xattr2_name, xattr2_value, ...]
+	 * So xattr names are in even position.
+	 */
+	for (i = 0; i < xattrs_external_num; i += 2) {
+		if (!lvol_check_exteranl_xattr_name(xattrs_external[i])) {
+			SPDK_ERRLOG("Invalid xattr name: %s\n", xattrs_external[i]);
+			cb_fn(cb_arg, NULL, -EINVAL);
+			return;
+		}
+	}
+
+	origblob = origlvol->blob;
+	lvs = origlvol->lvol_store;
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvol store does not exist\n");
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	rc = lvs_verify_lvol_name(lvs, snapshot_name);
+	if (rc < 0) {
+		cb_fn(cb_arg, NULL, rc);
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	newlvol = lvol_alloc(origlvol->lvol_store, snapshot_name, true,
+			     (enum lvol_clear_method)origlvol->clear_method);
+	if (!newlvol) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
+		free(req);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	xattr_external_dup = lvol_dup_xattr_list(xattrs_external, xattrs_external_num);
+	if (xattr_external_dup == NULL) {
+		SPDK_ERRLOG("Cannot duplicate external xattr list\n");
+		free(req);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	xattr_names = lvol_create_xattrs_names((const char *const *)&xattr_names_internal, xattrs_external,
+					       SPDK_COUNTOF(xattr_names_internal), xattrs_external_num);
+	if (xattr_names == NULL) {
+		SPDK_ERRLOG("Cannot create xattr name list\n");
+		free(req);
+		lvol_free_xattrs_list(xattr_external_dup);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	xattr_ctx.newlvol = newlvol;
+	xattr_ctx.xattrs_external = xattr_external_dup;
+	snapshot_xattrs.count = SPDK_COUNTOF(xattr_names_internal) + xattrs_external_num / 2;
+	snapshot_xattrs.ctx = &xattr_ctx;
+	snapshot_xattrs.names = xattr_names;
+	snapshot_xattrs.get_value = lvol_get_xattr_value_ext;
+	req->lvol = newlvol;
+	req->origlvol = origlvol;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->xattr_names = xattr_names;
+	req->xattrs_external = xattr_external_dup;
+
+	spdk_bs_create_snapshot(lvs->blobstore, spdk_blob_get_id(origblob), &snapshot_xattrs,
+				lvol_create_cb, req);
+}
+
 void
 spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 		       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
@@ -1358,7 +1634,7 @@ spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 	struct spdk_lvol_store *lvs;
 	struct spdk_blob *origblob;
 	struct spdk_blob_xattr_opts clone_xattrs;
-	char *xattr_names[] = {LVOL_NAME, "uuid"};
+	char *xattr_names[] = {LVOL_NAME, "uuid", LVOL_CREATION_TIME};
 	int rc;
 
 	if (origlvol == NULL) {
@@ -1543,6 +1819,57 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	spdk_blob_sync_md(blob, lvol_rename_cb, req);
 }
 
+static void
+lvol_set_xattr_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+
+	req->cb_fn(req->cb_arg,  lvolerrno);
+	free(req);
+}
+
+void
+spdk_lvol_set_xattr(struct spdk_lvol *lvol, const char *name, const char *value,
+		    spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob *blob = lvol->blob;
+	struct spdk_lvol_req *req;
+	int rc;
+
+	if (!lvol_check_exteranl_xattr_name(name)) {
+		SPDK_ERRLOG("Invalid xattr name: %s\n", name);
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	rc = spdk_blob_set_xattr(blob, name, value, strlen(value) + 1);
+	if (rc < 0) {
+		free(req);
+		cb_fn(cb_arg, rc);
+		return;
+	}
+
+	spdk_blob_sync_md(blob, lvol_set_xattr_cb, req);
+}
+
+int
+spdk_lvol_get_xattr(struct spdk_lvol *lvol, const char *name,
+		    const void **value, size_t *value_len)
+{
+	struct spdk_blob *blob = lvol->blob;
+
+	return spdk_blob_get_xattr_value(blob, name, value, value_len);
+}
+
 void
 spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -1584,6 +1911,12 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	rc = spdk_blob_get_clones(lvs->blobstore, lvol->blob_id, &clone_id, &count);
 	if (rc == 0 && count == 1) {
 		req->clone_lvol = lvs_get_lvol_by_blob_id(lvs, clone_id);
+		if (req->clone_lvol != NULL && req->clone_lvol->blob != NULL) {
+			if (spdk_blob_is_snapshot(req->clone_lvol->blob)) {
+				/* Snapshot's data could change, so we have to remove its checksum, if present */
+				spdk_blob_remove_xattr(req->clone_lvol->blob, LVOL_SNAPSHOT_CHECKSUM);
+			}
+		}
 	} else if (rc == -ENOMEM) {
 		SPDK_INFOLOG(lvol, "lvol %s: cannot destroy: has %" PRIu64 " clones\n",
 			     lvol->unique_id, count);
@@ -1647,7 +1980,9 @@ lvol_inflate_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
 
-	spdk_bs_free_io_channel(req->channel);
+	if (req->channel != NULL) {
+		spdk_bs_free_io_channel(req->channel);
+	}
 
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Could not inflate lvol\n");
@@ -1688,6 +2023,11 @@ spdk_lvol_inflate(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 		return;
 	}
 
+	if (spdk_blob_is_snapshot(lvol->blob)) {
+		/* Snapshot's data could change, so we have to remove its checksum, if present */
+		spdk_blob_remove_xattr(lvol->blob, LVOL_SNAPSHOT_CHECKSUM);
+	}
+
 	blob_id = spdk_blob_get_id(lvol->blob);
 	spdk_bs_inflate_blob(lvol->lvol_store->blobstore, req->channel, blob_id, lvol_inflate_cb,
 			     req);
@@ -1724,9 +2064,42 @@ spdk_lvol_decouple_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, v
 		return;
 	}
 
+	if (spdk_blob_is_snapshot(lvol->blob)) {
+		/* Snapshot's data could change, so we have to remove its checksum, if present */
+		spdk_blob_remove_xattr(lvol->blob, LVOL_SNAPSHOT_CHECKSUM);
+	}
+
 	blob_id = spdk_blob_get_id(lvol->blob);
 	spdk_bs_blob_decouple_parent(lvol->lvol_store->blobstore, req->channel, blob_id,
 				     lvol_inflate_cb, req);
+}
+
+void
+spdk_lvol_detach_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	spdk_blob_id blob_id;
+
+	assert(cb_fn != NULL);
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("Lvol does not exist\n");
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	blob_id = spdk_blob_get_id(lvol->blob);
+	spdk_bs_blob_detach_parent(lvol->lvol_store->blobstore, blob_id,
+				   lvol_inflate_cb, req);
 }
 
 static void
@@ -2307,6 +2680,62 @@ spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 	return rc;
 }
 
+int
+spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
+			     uint64_t cluster_count, struct spdk_bs_dev *ext_dev,
+			     spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+			     spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_copy_req *req;
+	spdk_blob_id blob_id;
+	int rc;
+
+	assert(cb_fn != NULL);
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol must not be NULL\n");
+		return -EINVAL;
+	}
+
+	assert(lvol->lvol_store->thread == spdk_get_thread());
+
+	if (ext_dev == NULL) {
+		SPDK_ERRLOG("lvol %s range shallow copy, ext_dev must not be NULL\n", lvol->unique_id);
+		return -EINVAL;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("lvol %s range shallow copy, cannot alloc memory for lvol request\n", lvol->unique_id);
+		return -ENOMEM;
+	}
+
+	req->lvol = lvol;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->channel = spdk_bs_alloc_io_channel(lvol->lvol_store->blobstore);
+	if (req->channel == NULL) {
+		SPDK_ERRLOG("lvol %s range shallow copy, cannot alloc io channel for lvol request\n",
+			    lvol->unique_id);
+		free(req);
+		return -ENOMEM;
+	}
+
+	blob_id = spdk_blob_get_id(lvol->blob);
+
+	rc = spdk_bs_blob_range_shallow_copy(lvol->lvol_store->blobstore, req->channel, blob_id,
+					     clusters_indexes, cluster_count, ext_dev,
+					     status_cb_fn, status_cb_arg, lvol_shallow_copy_cb, req);
+
+	if (rc < 0) {
+		SPDK_ERRLOG("Could not make a range shallow copy of lvol %s\n", lvol->unique_id);
+		spdk_bs_free_io_channel(req->channel);
+		free(req);
+	}
+
+	return rc;
+}
+
 static void
 lvol_set_parent_cb(void *cb_arg, int lvolerrno)
 {
@@ -2425,4 +2854,165 @@ spdk_lvol_set_external_parent(struct spdk_lvol *lvol, const void *esnap_id, uint
 
 	spdk_bs_blob_set_external_parent(lvol->lvol_store->blobstore, blob_id, bs_dev, esnap_id,
 					 esnap_id_len, lvol_set_external_parent_cb, req);
+}
+
+static void
+lvol_snapshot_checksum_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+
+	spdk_bs_free_io_channel(req->channel);
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("could not exec snapshot checksum of lvol %s, error %d\n", req->lvol->name, lvolerrno);
+	}
+
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+void
+spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot,
+				     spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+				     spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	spdk_blob_id blob_id;
+
+	assert(cb_fn != NULL);
+
+	if (snapshot == NULL) {
+		SPDK_ERRLOG("snapshot must not be NULL\n");
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	assert(snapshot->lvol_store->thread == spdk_get_thread());
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req->lvol = snapshot;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->channel = spdk_bs_alloc_io_channel(snapshot->lvol_store->blobstore);
+	if (req->channel == NULL) {
+		SPDK_ERRLOG("lvol %s snapshot checksum, cannot alloc io channel for lvol request\n",
+			    snapshot->unique_id);
+		free(req);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	blob_id = spdk_blob_get_id(snapshot->blob);
+
+	spdk_bs_snapshot_checksum(snapshot->lvol_store->blobstore, req->channel, blob_id,
+				  LVOL_SNAPSHOT_CHECKSUM, stop_cb_fn, stop_cb_arg, lvol_snapshot_checksum_cb, req);
+}
+
+int
+spdk_lvol_get_snapshot_checksum(struct spdk_lvol *snapshot, uint64_t *checksum)
+{
+	const char *attr;
+	size_t value_len = 0;
+	int rc;
+
+	if (snapshot == NULL) {
+		SPDK_ERRLOG("snapshot must not be NULL\n");
+		return -EINVAL;
+	}
+
+	if (checksum == NULL) {
+		SPDK_ERRLOG("checksum must not be NULL\n");
+		return -EINVAL;
+	}
+
+	rc = spdk_blob_get_xattr_value(snapshot->blob, LVOL_SNAPSHOT_CHECKSUM, (const void **)&attr,
+				       &value_len);
+	if (rc != 0) {
+		SPDK_INFOLOG(lvol, "No checksum xattr found\n");
+		return rc;
+	}
+
+	if (value_len != sizeof(*checksum)) {
+		SPDK_ERRLOG("Bad length of checksum xattr: %lu\n", value_len);
+		return -EDOM;
+	}
+
+	*checksum = *(uint64_t *)attr;
+	return 0;
+}
+
+void
+spdk_lvol_register_snapshot_range_checksums(struct spdk_lvol *snapshot,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	spdk_blob_id blob_id;
+
+	assert(cb_fn != NULL);
+
+	if (snapshot == NULL) {
+		SPDK_ERRLOG("snapshot must not be NULL\n");
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	assert(snapshot->lvol_store->thread == spdk_get_thread());
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req->lvol = snapshot;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->channel = spdk_bs_alloc_io_channel(snapshot->lvol_store->blobstore);
+	if (req->channel == NULL) {
+		SPDK_ERRLOG("lvol %s snapshot range checksums, cannot alloc io channel for lvol request\n",
+			    snapshot->unique_id);
+		free(req);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	blob_id = spdk_blob_get_id(snapshot->blob);
+
+	spdk_bs_snapshot_set_range_checksum(snapshot->lvol_store->blobstore, req->channel, blob_id,
+					    LVOL_SNAPSHOT_CHECKSUM, stop_cb_fn, stop_cb_arg,
+					    lvol_snapshot_checksum_cb, req);
+}
+
+int
+spdk_lvol_get_snapshot_range_checksums(struct spdk_lvol *snapshot, uint64_t *checksums,
+				       uint64_t cluster_start_index, uint64_t cluster_count)
+{
+	int rc;
+
+	if (snapshot == NULL) {
+		SPDK_ERRLOG("snapshot must not be NULL\n");
+		return -EINVAL;
+	}
+
+	if (checksums == NULL) {
+		SPDK_ERRLOG("checksums must not be NULL\n");
+		return -EINVAL;
+	}
+
+	rc = spdk_bs_snapshot_get_range_checksum(snapshot->blob, checksums, cluster_start_index,
+			cluster_count);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to get range checksums for snapshot %s\n", snapshot->name);
+		return rc;
+	}
+
+	return 0;
 }

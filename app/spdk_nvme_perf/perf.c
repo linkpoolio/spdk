@@ -174,11 +174,12 @@ struct perf_task {
 	struct ns_worker_ctx	*ns_ctx;
 	struct iovec		*iovs; /* array of iovecs to transfer. */
 	int			iovcnt; /* Number of iovecs in iovs array. */
+	int			iovpos; /* Current iovec position. */
+	uint32_t		iov_offset; /* Offset in current iovec. */
 	struct iovec		md_iov;
 	uint64_t		submit_tsc;
 	bool			is_read;
 	struct spdk_dif_ctx	dif_ctx;
-	struct spdk_nvme_ns_cmd_ext_io_opts	ext_opts;
 #if HAVE_LIBAIO
 	struct iocb		iocb;
 #endif
@@ -213,7 +214,6 @@ static int g_outstanding_commands;
 
 static bool g_latency_ssd_tracking_enable;
 static int g_latency_sw_tracking_level;
-static bool g_fua;
 
 static bool g_vmd;
 static const char *g_workload_type;
@@ -314,6 +314,8 @@ struct _trid_entry {
 	TAILQ_ENTRY(_trid_entry) tailq;
 };
 
+SPDK_LOG_DEPRECATION_REGISTER(perf_g_option, "perf -G option", "v26.05", 0);
+
 #define MAX_TRID_ENTRY 256
 static struct _trid_entry g_trids[MAX_TRID_ENTRY];
 static TAILQ_HEAD(, _trid_entry) g_trid_list = TAILQ_HEAD_INITIALIZER(g_trid_list);
@@ -330,12 +332,12 @@ perf_set_sock_opts(const char *impl_name, const char *field, uint32_t val, const
 	int rc;
 
 	rc = spdk_sock_impl_get_opts(impl_name, &sock_opts, &opts_size);
-	if (rc < 0) {
-		if (rc == -EINVAL) {
+	if (rc != 0) {
+		if (errno == EINVAL) {
 			fprintf(stderr, "Unknown sock impl %s\n", impl_name);
 		} else {
-			fprintf(stderr, "spdk_sock_impl_get_opts() failed, sock impl %s, %d: %s\n", impl_name, rc,
-				spdk_strerror(-rc));
+			fprintf(stderr, "Failed to get opts for sock impl %s: error %d (%s)\n", impl_name, errno,
+				strerror(errno));
 		}
 		return;
 	}
@@ -362,11 +364,46 @@ perf_set_sock_opts(const char *impl_name, const char *field, uint32_t val, const
 		return;
 	}
 
-	rc = spdk_sock_impl_set_opts(impl_name, &sock_opts, opts_size);
-	if (rc < 0) {
-		fprintf(stderr, "spdk_sock_impl_set_opts() failed to set %s: %d for sock impl %s, rc %d: %s\n",
-			field, val, impl_name, rc, strerror(-rc));
+	if (spdk_sock_impl_set_opts(impl_name, &sock_opts, opts_size)) {
+		fprintf(stderr, "Failed to set %s: %d for sock impl %s : error %d (%s)\n", field, val, impl_name,
+			errno, strerror(errno));
 	}
+}
+
+static void
+nvme_perf_reset_sgl(void *ref, uint32_t sgl_offset)
+{
+	struct iovec *iov;
+	struct perf_task *task = (struct perf_task *)ref;
+
+	task->iov_offset = sgl_offset;
+	for (task->iovpos = 0; task->iovpos < task->iovcnt; task->iovpos++) {
+		iov = &task->iovs[task->iovpos];
+		if (task->iov_offset < iov->iov_len) {
+			break;
+		}
+
+		task->iov_offset -= iov->iov_len;
+	}
+}
+
+static int
+nvme_perf_next_sge(void *ref, void **address, uint32_t *length)
+{
+	struct iovec *iov;
+	struct perf_task *task = (struct perf_task *)ref;
+
+	assert(task->iovpos < task->iovcnt);
+
+	iov = &task->iovs[task->iovpos];
+	assert(task->iov_offset <= iov->iov_len);
+
+	*address = iov->iov_base + task->iov_offset;
+	*length = iov->iov_len - task->iov_offset;
+	task->iovpos++;
+	task->iov_offset = 0;
+
+	return 0;
 }
 
 static int
@@ -805,9 +842,6 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 		exit(1);
 	}
 
-	task->ext_opts.size = SPDK_SIZEOF(&task->ext_opts, accel_sequence);
-	task->ext_opts.io_flags = task->ns_ctx->entry->io_flags;
-
 	max_io_md_size = g_max_io_md_size * g_max_io_size_blocks;
 	if (max_io_md_size != 0) {
 		task->md_iov.iov_base = spdk_dma_zmalloc(max_io_md_size, g_io_align, NULL);
@@ -818,7 +852,6 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 			free(task->iovs);
 			exit(1);
 		}
-		task->ext_opts.metadata = task->md_iov.iov_base;
 	}
 }
 
@@ -864,17 +897,24 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			fprintf(stderr, "Initialization of DIF context failed\n");
 			exit(1);
 		}
-		task->ext_opts.apptag_mask = task->dif_ctx.apptag_mask;
-		task->ext_opts.apptag = task->dif_ctx.app_tag;
-	} else {
-		task->ext_opts.apptag_mask = 0;
-		task->ext_opts.apptag = 0;
 	}
 
 	if (task->is_read) {
-		return spdk_nvme_ns_cmd_read_iov(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num], lba,
-						 entry->io_size_blocks, io_complete, task, task->iovs, task->iovcnt, &task->ext_opts);
-
+		if (task->iovcnt == 1) {
+			return spdk_nvme_ns_cmd_read_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
+							     task->iovs[0].iov_base, task->md_iov.iov_base,
+							     lba,
+							     entry->io_size_blocks, io_complete,
+							     task, entry->io_flags,
+							     task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
+		} else {
+			return spdk_nvme_ns_cmd_readv_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
+							      lba, entry->io_size_blocks,
+							      io_complete, task, entry->io_flags,
+							      nvme_perf_reset_sgl, nvme_perf_next_sge,
+							      task->md_iov.iov_base,
+							      task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
+		}
 	} else {
 		switch (mode) {
 		case DIF_MODE_DIF:
@@ -895,8 +935,22 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 		default:
 			break;
 		}
-		return spdk_nvme_ns_cmd_write_iov(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num], lba,
-						  entry->io_size_blocks, io_complete, task, task->iovs, task->iovcnt, &task->ext_opts);
+
+		if (task->iovcnt == 1) {
+			return spdk_nvme_ns_cmd_write_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
+							      task->iovs[0].iov_base, task->md_iov.iov_base,
+							      lba,
+							      entry->io_size_blocks, io_complete,
+							      task, entry->io_flags,
+							      task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
+		} else {
+			return spdk_nvme_ns_cmd_writev_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
+							       lba, entry->io_size_blocks,
+							       io_complete, task, entry->io_flags,
+							       nvme_perf_reset_sgl, nvme_perf_next_sge,
+							       task->md_iov.iov_base,
+							       task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
+		}
 	}
 }
 
@@ -974,8 +1028,6 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	ns_ctx->u.nvme.num_all_qpairs = g_nr_io_queues_per_ns + g_nr_unused_io_queues;
 	ns_ctx->u.nvme.qpair = calloc(ns_ctx->u.nvme.num_all_qpairs, sizeof(struct spdk_nvme_qpair *));
 	if (!ns_ctx->u.nvme.qpair) {
-		fprintf(stderr, "ERROR: calloc failed for qpair array (total=%d)\n",
-			ns_ctx->u.nvme.num_all_qpairs);
 		return -1;
 	}
 
@@ -1003,20 +1055,18 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 					  sizeof(opts));
 		qpair = ns_ctx->u.nvme.qpair[i];
 		if (!qpair) {
-			fprintf(stderr, "ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
+			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
 			goto qpair_failed;
 		}
 
-		rc = spdk_nvme_poll_group_add(group, qpair);
-		if (rc) {
-			fprintf(stderr, "ERROR: unable to add I/O qpair to poll group, rc:%d\n", rc);
+		if (spdk_nvme_poll_group_add(group, qpair)) {
+			printf("ERROR: unable to add I/O qpair to poll group.\n");
 			spdk_nvme_ctrlr_free_io_qpair(qpair);
 			goto qpair_failed;
 		}
 
-		rc = spdk_nvme_ctrlr_connect_io_qpair(entry->u.nvme.ctrlr, qpair);
-		if (rc) {
-			fprintf(stderr, "ERROR: unable to connect I/O qpair, rc:%d\n", rc);
+		if (spdk_nvme_ctrlr_connect_io_qpair(entry->u.nvme.ctrlr, qpair)) {
+			printf("ERROR: unable to connect I/O qpair.\n");
 			spdk_nvme_ctrlr_free_io_qpair(qpair);
 			goto qpair_failed;
 		}
@@ -1038,14 +1088,6 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 
 	/* If we reach here, it means we either timed out, or some connection failed. */
 	assert(spdk_get_ticks() > poll_timeout_tsc || rc == -EIO);
-
-	if (spdk_get_ticks() > poll_timeout_tsc) {
-		fprintf(stderr, "ERROR: qpair connect timeout\n");
-	} else if (rc == -EIO) {
-		fprintf(stderr, "ERROR: one or more IO qpairs failed after connect, rc=%d)\n", rc);
-	} else {
-		fprintf(stderr, "ERROR: unexpected qpair connect state rc=%d\n", rc);
-	}
 
 qpair_failed:
 	for (; i > 0; --i) {
@@ -1258,10 +1300,6 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 
 	if (spdk_nvme_ns_get_flags(ns) & SPDK_NVME_NS_DPS_PI_SUPPORTED) {
 		entry->io_flags = g_metacfg_pract_flag | g_metacfg_prchk_flags;
-	}
-
-	if (g_fua) {
-		entry->io_flags |= SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS;
 	}
 
 	/* If metadata size = 8 bytes, PI is stripped (read) or inserted (write),
@@ -1662,8 +1700,7 @@ work_fn(void *arg)
 	/* Allocate queue pairs for each namespace. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		if (init_ns_worker_ctx(ns_ctx) != 0) {
-			printf("ERROR: init_ns_worker_ctx() failed for nsid=%u\n",
-			       spdk_nvme_ns_get_id(ns_ctx->entry->u.nvme.ns));
+			printf("ERROR: init_ns_worker_ctx() failed\n");
 			/* Wait on barrier to avoid blocking of successful workers */
 			pthread_barrier_wait(&g_worker_sync_barrier);
 			ns_ctx->status = 1;
@@ -1850,7 +1887,7 @@ usage(char *program_name)
 	printf("\t\t(default: 1)\n");
 	spdk_nvme_transport_id_usage(stdout,
 				     SPDK_NVME_TRID_USAGE_OPT_LONGOPT | SPDK_NVME_TRID_USAGE_OPT_MULTI | SPDK_NVME_TRID_USAGE_OPT_NS |
-				     SPDK_NVME_TRID_USAGE_OPT_HOSTNQN | SPDK_NVME_TRID_USAGE_OPT_HOSTADDR);
+				     SPDK_NVME_TRID_USAGE_OPT_HOSTNQN);
 	printf("\n");
 
 	printf("==== ADVANCED OPTIONS ====\n\n");
@@ -1881,10 +1918,7 @@ usage(char *program_name)
 #endif
 	printf("\t--iova-mode <mode> specify DPDK IOVA mode: va|pa\n");
 	printf("\t--no-huge, SPDK is run without hugepages\n");
-	printf("\t--enforce-numa, SPDK is run with enforce-numa environment flag, useful to enforce NUMA restrictions on huge page allocations\n");
-	printf("\t--fua set the Force Unit Access (FUA) bit\n");
 	printf("\t--vfio-vf-token <token> VF token (UUID) shared between SR-IOV PF and VFs for vfio_pci driver\n");
-	printf("\t--env-context, Opaque context for use of the DPDK env implementation\n");
 	spdk_trace_mask_usage(stdout, "-y");
 	printf("\n");
 
@@ -1930,6 +1964,11 @@ usage(char *program_name)
 	printf("\t-Q, --continue-on-error <val> Do not stop on error. Log I/O errors every N times (default: 1)\n");
 	spdk_log_usage(stdout, "\t-T");
 	printf("\t-m, --cpu-usage display real-time overall cpu usage on used cores\n");
+#ifdef DEBUG
+	printf("\t-G, --enable-debug enable debug logging\n");
+#else
+	printf("\t-G, --enable-debug enable debug logging (flag disabled, must reconfigure with --enable-debug)\n");
+#endif
 	printf("\t--transport-stats dump transport statistics\n");
 	printf("\n\n");
 }
@@ -2293,7 +2332,7 @@ alloc_key(const char *name, const char *path)
 	return key;
 }
 
-#define PERF_GETOPT_SHORT "a:b:c:d:e:ghi:lmo:q:r:k:s:t:v:w:y:z:A:C:DEF:HILM:NO:P:Q:RS:T:U:VZ:"
+#define PERF_GETOPT_SHORT "a:b:c:d:e:ghi:lmo:q:r:k:s:t:v:w:y:z:A:C:DEF:GHILM:NO:P:Q:RS:T:U:VZ:"
 
 static const struct option g_perf_cmdline_opts[] = {
 #define PERF_WARMUP_TIME	'a'
@@ -2342,6 +2381,8 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"enable-interrupt",			no_argument,	NULL, PERF_ENABLE_INTERRUPT},
 #define PERF_ZIPF		'F'
 	{"zipf",				required_argument,	NULL, PERF_ZIPF},
+#define PERF_ENABLE_DEBUG	'G'
+	{"enable-debug",			no_argument,	NULL, PERF_ENABLE_DEBUG},
 #define PERF_ENABLE_TCP_HDGST	'H'
 	{"enable-tcp-hdgst",			no_argument,	NULL, PERF_ENABLE_TCP_HDGST},
 #define PERF_ENABLE_TCP_DDGST	'I'
@@ -2408,12 +2449,6 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"vfio-vf-token", required_argument, NULL, PERF_VFIO_VF_TOKEN},
 #define PERF_LOG_LEVEL		274
 	{"log-level", required_argument, NULL, PERF_LOG_LEVEL},
-#define PERF_ENFORCE_NUMA   275
-	{"enforce-numa",			no_argument,	NULL, PERF_ENFORCE_NUMA},
-#define PERF_ENV_CONTEXT    276
-	{"env-context",			required_argument,	NULL, PERF_ENV_CONTEXT},
-#define PERF_FUA		277
-	{"fua",				no_argument,	NULL, PERF_FUA},
 #define PERF_HELP_FULL 'v'
 	{"help-full", no_argument, NULL, PERF_HELP_FULL},
 	/* Should be the last element */
@@ -2612,6 +2647,18 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_ENABLE_INTERRUPT:
 			g_enable_interrupt = 1;
 			break;
+		case PERF_ENABLE_DEBUG:
+#ifndef DEBUG
+			fprintf(stderr, "%s must be configured with --enable-debug for -G flag\n",
+				argv[0]);
+			usage(argv[0]);
+			return 1;
+#else
+			SPDK_LOG_DEPRECATED(perf_g_option);
+			spdk_log_set_flag("nvme");
+			debug_implied = true;
+			break;
+#endif
 		case PERF_ENABLE_TCP_HDGST:
 			g_header_digest = 1;
 			break;
@@ -2706,8 +2753,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			sock_impl = optarg;
 			rc = spdk_sock_set_default_impl(optarg);
 			if (rc) {
-				fprintf(stderr, "spdk_sock_set_default_impl() failed to set sock impl %s, rc %d: %s\n", optarg, rc,
-					spdk_strerror(-rc));
+				fprintf(stderr, "Failed to set sock impl %s, err %d (%s)\n", optarg, errno, strerror(errno));
 				return 1;
 			}
 			break;
@@ -2730,15 +2776,6 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			break;
 		case PERF_NO_HUGE:
 			env_opts->no_huge = true;
-			break;
-		case PERF_ENFORCE_NUMA:
-			env_opts->enforce_numa = true;
-			break;
-		case PERF_ENV_CONTEXT:
-			env_opts->env_context = optarg;
-			break;
-		case PERF_FUA:
-			g_fua = true;
 			break;
 		case PERF_VFIO_VF_TOKEN:
 			g_vf_token = strdup(optarg);
@@ -2898,7 +2935,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	}
 
 	/*
-	 * If the user didn't explicitly set a log level, but used -T,
+	 * If the user didn't explicitly set a log level, but used -G or -T,
 	 * default to DEBUG to preserve legacy behavior.
 	 */
 	if (!log_level_set && debug_implied) {
@@ -2965,12 +3002,9 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		if (g_no_shn_notification) {
 			opts->no_shn_notification = true;
 		}
-	}
-
-	if (g_enable_interrupt &&
-	    (trid->trtype == SPDK_NVME_TRANSPORT_PCIE ||
-	     trid->trtype == SPDK_NVME_TRANSPORT_RDMA)) {
-		opts->enable_interrupts = true;
+		if (g_enable_interrupt) {
+			opts->enable_interrupts = true;
+		}
 	}
 
 	if (trid->trtype != trid_entry->trid.trtype &&
@@ -2988,7 +3022,6 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	opts->dhchap_key = g_dhchap;
 	opts->dhchap_ctrlr_key = g_dhchap_ctrlr;
 	memcpy(opts->hostnqn, trid_entry->hostnqn, sizeof(opts->hostnqn));
-	memcpy(opts->src_addr, trid_entry->hostaddr, sizeof(opts->src_addr));
 
 	opts->transport_tos = g_transport_tos;
 	if (opts->num_io_queues < g_num_workers * g_nr_io_queues_per_ns) {
@@ -3002,9 +3035,11 @@ static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
-	if (g_enable_interrupt && !opts->enable_interrupts) {
-		fprintf(stderr, "Couldn't enable interrupts on NVMe controller at %s\n", trid->traddr);
-		return;
+	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
+		if (g_enable_interrupt && !opts->enable_interrupts) {
+			fprintf(stderr, "Couldn't enable interrupts on NVMe controller at %s\n", trid->traddr);
+			return;
+		}
 	}
 
 	register_ctrlr(ctrlr, cb_ctx);
