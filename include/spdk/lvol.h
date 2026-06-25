@@ -22,6 +22,7 @@ extern "C" {
 struct spdk_bs_dev;
 struct spdk_lvol_store;
 struct spdk_lvol;
+struct spdk_fragmap;
 
 enum lvol_clear_method {
 	LVOL_CLEAR_WITH_DEFAULT = BLOB_CLEAR_WITH_DEFAULT,
@@ -120,6 +121,16 @@ typedef void (*spdk_lvol_op_with_handle_complete)(void *cb_arg, struct spdk_lvol
 typedef void (*spdk_lvol_op_complete)(void *cb_arg, int lvolerrno);
 
 /**
+ * Callback definition for lvol operations with handle to fragmap
+ *
+ * @param cb_arg Custom arguments
+ * @param fragmap Handle to fragmap or NULL when lvolerrno is set
+ * @param lvolerrno Error
+ */
+typedef void (*spdk_lvol_op_with_fragmap_handle_complete)(void *cb_arg,
+		struct spdk_fragmap *fragmap, int lvolerrno);
+
+/**
  * Callback definition for spdk_lvol_iter_clones.
  *
  * \param lvol An iterated lvol.
@@ -209,6 +220,20 @@ void spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name
 			       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
+ * Create snapshot of given lvol with xattrs.
+ *
+ * \param lvol Handle to lvol.
+ * \param snapshot_name Name of created snapshot.
+ * \param xattrs Xattrs list for the snapshot (the list has the format par1, val1, par2, val2, ...).
+ * \param xattrs_num Number of elements in the \c xattrs list.
+ * \param cb_fn Completion callback.
+ * \param cb_arg Completion callback custom arguments.
+ */
+void spdk_lvol_create_snapshot_with_xattrs(struct spdk_lvol *lvol, const char *snapshot_name,
+		const char *const *xattrs, size_t xattrs_num,
+		spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+/**
  * Create clone of given snapshot.
  *
  * \param lvol Handle to lvol snapshot.
@@ -252,6 +277,31 @@ int spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t
 void
 spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Set lvol's xattr.
+ *
+ * \param lvol Handle to lvol.
+ * \param name xattr name.
+ * \param value xattr value.
+ * \param cb_fn Completion callback.
+ * \param cb_arg Completion callback custom arguments.
+ */
+void
+spdk_lvol_set_xattr(struct spdk_lvol *lvol, const char *name, const char *value,
+		    spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Get lvol's xattr.
+ *
+ * \param lvol Handle to lvol.
+ * \param name Xattr name.
+ * \param value Xattr value.
+ * \param value_len Xattr value length.
+ */
+int
+spdk_lvol_get_xattr(struct spdk_lvol *lvol, const char *name,
+		    const void **value, size_t *value_len);
 
 /**
  * \brief Returns if it is possible to delete an lvol (i.e. lvol is not a snapshot that have at least one clone).
@@ -387,6 +437,15 @@ void spdk_lvol_inflate(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void
 void spdk_lvol_decouple_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Detach parent of lvol
+ *
+ * \param lvol Handle to lvol
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ */
+void spdk_lvol_detach_parent(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
  * Determine if an lvol is degraded. A degraded lvol cannot perform IO.
  *
  * \param lvol Handle to lvol
@@ -410,8 +469,52 @@ bool spdk_lvol_is_degraded(const struct spdk_lvol *lvol);
  * \return 0 if operation starts correctly, negative errno on failure.
  */
 int spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
+			   uint32_t pipeline_depth,
 			   spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			   spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Make a deep copy of lvol on given bs_dev.
+ *
+ * Lvol must be read only and lvol size must be less or equal than bs_dev size.
+ *
+ * \param lvol Handle to lvol
+ * \param ext_dev The bs_dev to copy on. This is created on the given bdev by using
+ * spdk_bdev_create_bs_dev_ext() beforehand
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_lvol_deep_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
+			spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+			spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Make a ranged shallow copy of lvol on given bs_dev.
+ *
+ * Lvol must be read only, and the cluster range must fit into lvol and device size.
+ * Lvol size must be less or equal than bs_dev size.
+ *
+ * \param lvol Handle to lvol
+ * \param clusters_indexes The array containing the indexes of the clusters to be synchronized
+ * \param cluster_count The number of clusters into the index array
+ * \param ext_dev The bs_dev to copy on. This is created on the given bdev by using
+ * spdk_bdev_create_bs_dev_ext() beforehand
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
+				 uint64_t cluster_count, struct spdk_bs_dev *ext_dev,
+				 uint32_t pipeline_depth,
+				 spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				 spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
  * Set a snapshot as the parent of a lvol
@@ -448,6 +551,70 @@ void spdk_lvol_set_parent(struct spdk_lvol *lvol, struct spdk_lvol *snapshot,
 void spdk_lvol_set_external_parent(struct spdk_lvol *lvol, const void *esnap_id,
 				   uint32_t esnap_id_len,
 				   spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Compute and store snapshot's checksum.
+ *
+ * The computed checksum is crc64 iso reflected.
+ * The snapshot must have the option to add and update xattrs after its creation enabled.
+ *
+ * \param lvol Handle to snapshot
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ */
+void spdk_lvol_register_snapshot_checksum(struct spdk_lvol *snapshot,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Get snapshot's stored checksum.
+ *
+ * The lvol must be a snapshot and the checksum must has been previously registered.
+ *
+ * \param snapshot Handle to snapshot.
+ * \param checksum Parameter as output.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int
+spdk_lvol_get_snapshot_checksum(struct spdk_lvol *snapshot, uint64_t *checksum);
+
+/**
+ * Compute and store snapshot's whole and clusters checksums.
+ *
+ * A checksum for the whole lvol and a checksum for every allocated cluster is computed and stored
+ * in snapshot's metadata.
+ * The computed checksum is crc64 iso reflected.
+ *
+ * \param lvol Handle to snapshot
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ */
+void spdk_lvol_register_snapshot_range_checksums(struct spdk_lvol *snapshot,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Get snapshot's clusters checksums in a specific range.
+ *
+ * The lvol must be a snapshot and the checksums must has been previously registered.
+ * Checksums array must be allocated and the range must fit into snapshot's cluster number.
+ *
+ * \param snapshot Handle to snapshot.
+ * \param checksums Array of the checksums.
+ * \param cluster_start_index The index of the first cluster whose checksum must be retrieved.
+ * \param cluster_count The number of clusters whose checksums must be retrieved.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int
+spdk_lvol_get_snapshot_range_checksums(struct spdk_lvol *snapshot, uint64_t *checksums,
+				       uint64_t cluster_start_index, uint64_t cluster_count);
+
 
 #ifdef __cplusplus
 }

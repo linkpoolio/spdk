@@ -82,6 +82,14 @@ enum spdk_blob_state {
 	 */
 	SPDK_BLOB_STATE_DIRTY,
 
+	/* The blob in-memory version does not match the on-disk
+	 * version because xattrs have been added or updated.
+	 * This state is used to add or update xattrs to read
+	 * only blobs, for which it is not possible to change
+	 * other blob metadata.
+	 */
+	SPDK_BLOB_STATE_DIRTY_XATTR,
+
 	/* The blob in memory version of the blob matches the on disk
 	 * version.
 	 */
@@ -134,6 +142,16 @@ struct spdk_blob {
 	 */
 	struct spdk_xattr_tailq xattrs;
 	struct spdk_xattr_tailq xattrs_internal;
+
+	/* Number of clusters checksums in the blob */
+	uint64_t	num_clusters_checksums;
+
+	/*
+	 * Array of checksum, one for each cluster, 0 means cluster not allocated.
+	 * The array has num_clusters_checksums size and can be allocated only for
+	 * snapshots.
+	 */
+	uint64_t	*clusters_checksums;
 
 	RB_ENTRY(spdk_blob) link;
 
@@ -295,6 +313,10 @@ struct spdk_bs_md_mask {
  * with 0's being unallocated clusters. It is NOT part of
  * serialized metadata chain for a blob. */
 #define SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE 6
+/* CHECKSUM descriptor holds an array of checksum. The array is
+ * run-length encoded, with 0's being unallocated clusters.
+ * It is part of serialized metadata chain for a blob. */
+#define SPDK_MD_DESCRIPTOR_TYPE_CHECKSUM 7
 
 struct spdk_blob_md_descriptor_xattr {
 	uint8_t		type;
@@ -338,6 +360,16 @@ struct spdk_blob_md_descriptor_extent_page {
 	uint32_t	start_cluster_idx;
 
 	uint32_t	cluster_idx[0];
+};
+
+struct spdk_blob_md_descriptor_clusters_checksums {
+	uint8_t		type;
+	uint32_t	length;
+
+	struct {
+		uint64_t	checksum;
+		uint32_t	length; /* In units of clusters */
+	} checksums[0];
 };
 
 #define SPDK_BLOB_THIN_PROV		(1ULL << 0)

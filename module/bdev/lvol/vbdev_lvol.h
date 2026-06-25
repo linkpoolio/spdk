@@ -43,6 +43,7 @@ int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz
 		      void *cb_arg);
 
 void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+				const char *const *xattrs, size_t xattrs_num,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
@@ -72,6 +73,27 @@ void vbdev_lvol_set_read_only(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_f
 
 void vbdev_lvol_rename(struct spdk_lvol *lvol, const char *new_lvol_name,
 		       spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * \brief Set lvol's xattr
+ * \param lvol Handle to lvol
+ * \param name xattr name
+ * \param value xattr value
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ */
+void vbdev_lvol_set_xattr(struct spdk_lvol *lvol, const char *name,
+			  const char *value, spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * \brief Get lvol's xattr
+ * \param lvol Handle to lvol
+ * \param name Xattr name
+ * \param value Xattr value
+ * \param value_len Xattr value length
+ */
+int vbdev_lvol_get_xattr(struct spdk_lvol *lvol, const char *name,
+			 const void **value, size_t *value_len);
 
 /**
  * Destroy a logical volume
@@ -132,8 +154,45 @@ int vbdev_lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *
  * \return 0 if operation starts correctly, negative errno on failure.
  */
 int vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			    uint32_t pipeline_depth,
 			    spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			    spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * \brief Make a deep copy of lvol over a bdev
+ *
+ * \param lvol Handle to lvol
+ * \param bdev_name Name of the bdev to copy on
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int vbdev_lvol_deep_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			 spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+			 spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * \brief Make a range shallow copy of lvol over a bdev
+ *
+ * \param lvol Handle to lvol
+ * \param bdev_name Name of the bdev to copy on
+ * \param clusters_indexes The array containing the indexes of the clusters to be synchronized
+ * \param cluster_count The number of clusters into the index array
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Completion callback
+ * \param cb_arg Completion callback custom arguments
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+				  uint64_t *clusters_indexes, uint64_t cluster_count,
+				  uint32_t pipeline_depth,
+				  spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				  spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
  * \brief Set an external snapshot as the parent of a lvol.
@@ -145,5 +204,17 @@ int vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
  */
 void vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
 				    spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/**
+ * @brief Get a fragmap for a specific segment of a logical volume using the provided offset and size
+ *
+ * @param lvol Handle to lvol
+ * @param offset Offset in bytes of the specific segment of the logical volume
+ * @param size Size in bytes of the specific segment of the logical volume
+ * @param cb_fn Completion callback
+ * @param cb_arg Completion callback custom arguments
+ */
+void vbdev_lvol_get_fragmap(struct spdk_lvol *lvol, uint64_t offset, uint64_t size,
+			    spdk_lvol_op_with_fragmap_handle_complete cb_fn, void *cb_arg);
 
 #endif /* SPDK_VBDEV_LVOL_H */

@@ -5215,6 +5215,12 @@
           "type": "string",
           "required": true,
           "description": "Name for the newly created snapshot"
+        },
+        {
+          "name": "xattrs",
+          "type": "array",
+          "required": false,
+          "description": "a map of xattr keys to values"
         }
       ]
     },
@@ -5255,6 +5261,46 @@
           "type": "string",
           "required": true,
           "description": "Name for the logical volume to create"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_set_xattr",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "lvol bdev name"
+        },
+        {
+          "name": "xattr_name",
+          "type": "string",
+          "required": true,
+          "description": "xattr name"
+        },
+        {
+          "name": "xattr_value",
+          "type": "string",
+          "required": true,
+          "description": "xattr value"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_get_xattr",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "lvol bdev name"
+        },
+        {
+          "name": "xattr_name",
+          "type": "string",
+          "required": true,
+          "description": "Xattr name"
         }
       ]
     },
@@ -5337,6 +5383,17 @@
       ]
     },
     {
+      "name": "bdev_lvol_detach_parent",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the logical volume to detach the parent of it"
+        }
+      ]
+    },
+    {
       "name": "bdev_lvol_get_lvols",
       "params": [
         {
@@ -5386,6 +5443,29 @@
       ]
     },
     {
+      "name": "bdev_lvol_get_fragmap",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the logical volume"
+        },
+        {
+          "name": "offset",
+          "type": "number",
+          "required": false,
+          "description": "Offset in bytes of the specific segment of the logical volume (Default: 0)"
+        },
+        {
+          "name": "size",
+          "type": "number",
+          "required": false,
+          "description": "Size in bytes of the specific segment of the logical volume (Default: 0 for representing the entire file)"
+        }
+      ]
+    },
+    {
       "name": "bdev_lvol_start_shallow_copy",
       "params": [
         {
@@ -5410,6 +5490,96 @@
           "type": "uint32",
           "required": true,
           "description": "operation identifier"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_start_range_shallow_copy",
+      "params": [
+        {
+          "name": "src_lvol_name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of lvol to create a copy from"
+        },
+        {
+          "name": "dst_bdev_name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the bdev that acts as destination for the copy"
+        },
+        {
+          "name": "clusters",
+          "type": "array",
+          "required": true,
+          "description": "Array of indexes of the clusters to be synchronized"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_register_snapshot_checksum",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the snapshot"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_get_snapshot_checksum",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the snapshot"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_stop_snapshot_checksum",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the snapshot"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_register_snapshot_range_checksums",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the snapshot"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_get_snapshot_range_checksums",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "UUID or alias of the snapshot"
+        },
+        {
+          "name": "cluster_start_index",
+          "type": "number",
+          "required": true,
+          "description": "start index of the cluster range"
+        },
+        {
+          "name": "cluster_count",
+          "type": "number",
+          "required": true,
+          "description": "number of clusters in the range"
         }
       ]
     },

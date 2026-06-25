@@ -12,9 +12,13 @@
 #include "spdk/queue.h"
 #include "spdk/tree.h"
 #include "spdk/uuid.h"
+#include "spdk/thread.h"
 
 /* Default size of blobstore cluster */
 #define SPDK_LVS_OPTS_CLUSTER_SZ (4 * 1024 * 1024)
+
+/* Creation time format in RFC 3339 format */
+#define SPDK_CREATION_TIME_MAX 21 /* 20 characters + null terminator */
 
 /* UUID + '_' + blobid (20 characters for uint64_t).
  * Null terminator is already included in SPDK_UUID_STRING_LEN. */
@@ -74,6 +78,8 @@ struct spdk_lvol_with_handle_req {
 	void				*cb_arg;
 	struct spdk_lvol		*lvol;
 	struct spdk_lvol		*origlvol;
+	char				**xattr_names;
+	char				**xattrs_external;
 };
 
 struct spdk_lvol_bs_dev_req {
@@ -106,6 +112,8 @@ struct spdk_lvol_store {
 	struct spdk_thread		*thread;
 };
 
+typedef TAILQ_HEAD(, freeze_range) lvol_freeze_range_tailq_t;
+
 struct spdk_lvol {
 	struct spdk_lvol_store		*lvol_store;
 	struct spdk_blob		*blob;
@@ -114,6 +122,7 @@ struct spdk_lvol {
 	char				name[SPDK_LVOL_NAME_MAX];
 	struct spdk_uuid		uuid;
 	char				uuid_str[SPDK_UUID_STRING_LEN];
+	char				creation_time[SPDK_CREATION_TIME_MAX];
 	struct spdk_bdev		*bdev;
 	int				ref_count;
 	bool				action_in_progress;
@@ -121,6 +130,42 @@ struct spdk_lvol {
 	TAILQ_ENTRY(spdk_lvol)		link;
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
+
+	struct spdk_spinlock		spinlock;
+	/*
+	 * Currently freezed ranges for this lvol. Used to populate new channels.
+	 * Protected by spinlock.
+	 */
+	lvol_freeze_range_tailq_t	freezed_ranges;
+	/* Pending freezed ranges for this lvol. These ranges are not currently
+	 * freezed due to overlapping with another freezed range.
+	 * Protected by spinlock.
+	 */
+	lvol_freeze_range_tailq_t	pending_freezed_ranges;
+};
+
+struct spdk_fragmap {
+	struct spdk_bit_array *map;
+
+	uint64_t cluster_size;
+	uint64_t block_size;
+	uint64_t num_clusters;
+	uint64_t num_allocated_clusters;
+};
+
+struct spdk_fragmap_req {
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *bdev_desc;
+	struct spdk_io_channel *bdev_io_channel;
+
+	struct spdk_fragmap fragmap;
+
+	uint64_t offset;
+	uint64_t size;
+	uint64_t current_offset;
+
+	spdk_lvol_op_with_fragmap_handle_complete cb_fn;
+	void *cb_arg;
 };
 
 struct lvol_store_bdev *vbdev_lvol_store_first(void);

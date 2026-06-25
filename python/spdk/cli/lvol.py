@@ -74,13 +74,24 @@ def add_parser(subparsers):
     p.set_defaults(func=bdev_lvol_create)
 
     def bdev_lvol_snapshot(args):
+        xattrs = None
+        if args.xattr:
+            xattrs = {}
+            for entry in args.xattr:
+                parts = entry.split('=', 1)
+                if len(parts) != 2:
+                    raise Exception('--xattr %s not in key=value format' % entry)
+                xattrs[parts[0]] = parts[1]
         print_json(args.client.bdev_lvol_snapshot(
                                                lvol_name=args.lvol_name,
-                                               snapshot_name=args.snapshot_name))
+                                               snapshot_name=args.snapshot_name,
+                                               xattrs=xattrs))
 
     p = subparsers.add_parser('bdev_lvol_snapshot', help='Create a snapshot of an lvol bdev')
     p.add_argument('lvol_name', help='lvol bdev name')
     p.add_argument('snapshot_name', help='lvol snapshot name')
+    p.add_argument('--xattr', action='append', metavar='key=value',
+                   help="adds a key=value xattr to the snapshot")
     p.set_defaults(func=bdev_lvol_snapshot)
 
     def bdev_lvol_clone(args):
@@ -106,6 +117,28 @@ def add_parser(subparsers):
     p.add_argument('clone_name', help='lvol clone name')
     p.set_defaults(func=bdev_lvol_clone_bdev)
 
+    def bdev_lvol_set_xattr(args):
+        args.client.bdev_lvol_set_xattr(
+                                     name=args.name,
+                                     xattr_name=args.xattr_name,
+                                     xattr_value=args.xattr_value)
+
+    p = subparsers.add_parser('bdev_lvol_set_xattr', help='Set xattr for lvol bdev')
+    p.add_argument('name', help='lvol bdev name')
+    p.add_argument('xattr_name', help='xattr name')
+    p.add_argument('xattr_value', help='xattr value')
+    p.set_defaults(func=bdev_lvol_set_xattr)
+
+    def bdev_lvol_get_xattr(args):
+        print_dict(args.client.bdev_lvol_get_xattr(
+                                                name=args.name,
+                                                xattr_name=args.xattr_name))
+
+    p = subparsers.add_parser('bdev_lvol_get_xattr', help='Get xattr for lvol bdev')
+    p.add_argument('name', help='lvol bdev name')
+    p.add_argument('xattr_name', help='xattr name')
+    p.set_defaults(func=bdev_lvol_get_xattr)
+
     def bdev_lvol_rename(args):
         args.client.bdev_lvol_rename(
                                   old_name=args.old_name,
@@ -129,6 +162,14 @@ def add_parser(subparsers):
     p = subparsers.add_parser('bdev_lvol_decouple_parent', help='Decouple parent of lvol')
     p.add_argument('name', help='lvol bdev name')
     p.set_defaults(func=bdev_lvol_decouple_parent)
+
+    def bdev_lvol_detach_parent(args):
+        args.client.bdev_lvol_detach_parent(
+                                          name=args.name)
+
+    p = subparsers.add_parser('bdev_lvol_detach_parent', help='Detach parent of lvol')
+    p.add_argument('name', help='lvol bdev name')
+    p.set_defaults(func=bdev_lvol_detach_parent)
 
     def bdev_lvol_resize(args):
         args.client.bdev_lvol_resize(
@@ -173,6 +214,60 @@ def add_parser(subparsers):
     p.add_argument('operation_id', help='operation identifier', type=int)
     p.set_defaults(func=bdev_lvol_check_shallow_copy)
 
+    def bdev_lvol_start_deep_copy(args):
+        print_json(args.client.bdev_lvol_start_deep_copy(
+                                                        src_lvol_name=args.src_lvol_name,
+                                                        dst_bdev_name=args.dst_bdev_name))
+
+    p = subparsers.add_parser('bdev_lvol_start_deep_copy',
+                              help="""Start a deep copy of a lvol over a given bdev. The status of the operation
+    can be obtained with bdev_lvol_check_deep_copy""")
+    p.add_argument('src_lvol_name', help='source lvol name')
+    p.add_argument('dst_bdev_name', help='destination bdev name')
+    p.set_defaults(func=bdev_lvol_start_deep_copy)
+
+    def bdev_lvol_check_deep_copy(args):
+        print_json(args.client.bdev_lvol_check_deep_copy(
+                                                        operation_id=args.operation_id))
+
+    p = subparsers.add_parser('bdev_lvol_check_deep_copy', help='Get deep copy status')
+    p.add_argument('operation_id', help='operation identifier', type=int)
+    p.set_defaults(func=bdev_lvol_check_deep_copy)
+
+    def bdev_lvol_start_range_shallow_copy(args):
+        print_json(args.client.bdev_lvol_start_range_shallow_copy(
+                                                                src_lvol_name=args.src_lvol_name,
+                                                                dst_bdev_name=args.dst_bdev_name,
+                                                                clusters=args.clusters))
+
+    p = subparsers.add_parser('bdev_lvol_start_range_shallow_copy',
+                              help="""Start a range shallow copy of an lvol over a given bdev.  The
+    status of the operation can be obtained with bdev_lvol_check_shallow_copy""")
+    p.add_argument('src_lvol_name', help='source lvol name')
+    p.add_argument('dst_bdev_name', help='destination bdev name')
+    p.add_argument('--clusters', help="""List of clusters indexes. Example: 2 3 4 etc""", type=int, nargs='+')
+    p.set_defaults(func=bdev_lvol_start_range_shallow_copy)
+
+    def bdev_lvol_register_snapshot_range_checksums(args):
+        args.client.bdev_lvol_register_snapshot_range_checksums(
+                                                             name=args.name)
+
+    p = subparsers.add_parser('bdev_lvol_register_snapshot_range_checksums', help='Compute and store snapshot\'s whole and clusters checksums')
+    p.add_argument('name', help='snapshot bdev name')
+    p.set_defaults(func=bdev_lvol_register_snapshot_range_checksums)
+
+    def bdev_lvol_get_snapshot_range_checksums(args):
+        print_json(args.client.bdev_lvol_get_snapshot_range_checksums(
+                                                            name=args.name,
+                                                            cluster_start_index=args.cluster_start_index,
+                                                            cluster_count=args.cluster_count))
+
+    p = subparsers.add_parser('bdev_lvol_get_snapshot_range_checksums', help='Get snapshot\'s clusters checksums in a specific range')
+    p.add_argument('name', help='snapshot bdev name')
+    p.add_argument('cluster_start_index', help='start index of the cluster range', type=int)
+    p.add_argument('cluster_count', help='number of clusters in the range', type=int)
+    p.set_defaults(func=bdev_lvol_get_snapshot_range_checksums)
+
     def bdev_lvol_set_parent(args):
         args.client.bdev_lvol_set_parent(
                                       lvol_name=args.lvol_name,
@@ -192,6 +287,42 @@ def add_parser(subparsers):
     p.add_argument('lvol_name', help='lvol name')
     p.add_argument('parent_name', help='parent external snapshot name')
     p.set_defaults(func=bdev_lvol_set_parent_bdev)
+
+    def bdev_lvol_get_fragmap(args):
+        print_json(args.client.bdev_lvol_get_fragmap(
+                                                  name=args.name,
+                                                  offset=args.offset,
+                                                  size=args.size))
+    p = subparsers.add_parser('bdev_lvol_get_fragmap', help="""Get a fragmap for a specific segment of a logical volume using
+                                                            the provided offset and size.""")
+    p.add_argument('name', help='lvol bdev name')
+    p.add_argument('--offset', help='offset in bytes of the specific segment of the logical volume', type=int, required=False)
+    p.add_argument('--size', help='size in bytes of the specific segment of the logical volume', type=int, required=False)
+    p.set_defaults(func=bdev_lvol_get_fragmap)
+
+    def bdev_lvol_register_snapshot_checksum(args):
+        args.client.bdev_lvol_register_snapshot_checksum(
+                                                      name=args.name)
+
+    p = subparsers.add_parser('bdev_lvol_register_snapshot_checksum', help='Compute and store snapshot\'s checksum')
+    p.add_argument('name', help='snapshot bdev name')
+    p.set_defaults(func=bdev_lvol_register_snapshot_checksum)
+
+    def bdev_lvol_get_snapshot_checksum(args):
+        print_json(args.client.bdev_lvol_get_snapshot_checksum(
+                                                            name=args.name))
+
+    p = subparsers.add_parser('bdev_lvol_get_snapshot_checksum', help='Get snapshot\'s stored checksum')
+    p.add_argument('name', help='snapshot bdev name')
+    p.set_defaults(func=bdev_lvol_get_snapshot_checksum)
+
+    def bdev_lvol_stop_snapshot_checksum(args):
+        args.client.bdev_lvol_stop_snapshot_checksum(
+                                                    name=args.name)
+
+    p = subparsers.add_parser('bdev_lvol_stop_snapshot_checksum', help='Stop the registration of a snapshot\'s checksum')
+    p.add_argument('name', help='snapshot bdev name')
+    p.set_defaults(func=bdev_lvol_stop_snapshot_checksum)
 
     def bdev_lvol_delete_lvstore(args):
         args.client.bdev_lvol_delete_lvstore(

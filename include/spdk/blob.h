@@ -156,7 +156,29 @@ typedef int (*spdk_bs_esnap_dev_create)(void *bs_ctx, void *blob_ctx, struct spd
  * \param copied_clusters Actual number of copied clusters by the shallow copy operation
  * \param cb_arg Callback argument.
  */
-typedef void (*spdk_blob_shallow_copy_status)(uint64_t copied_clusters, void *cb_arg);
+typedef void (*spdk_blob_shallow_copy_status)(uint64_t copied_clusters, uint64_t unmapped_clusters,
+		void *cb_arg);
+
+/**
+ * Blob deep copy status callback.
+ *
+ * \param processed_clusters Number of processed clusters by the deep copy operation
+ * \param cb_arg Callback argument.
+ */
+typedef void (*spdk_blob_deep_copy_status)(uint64_t processed_clusters,
+		void *cb_arg);
+
+/**
+ * Snapshot checksum stop callback.
+ *
+ * This callback inform the snapshot checksum compute operation if it can proceed or if
+ * it must abort.
+ *
+ * \param cb_arg callback argument.
+ *
+ * \return true to stop the operation, false to let it to continue.
+ */
+typedef bool (*spdk_snapshot_checksum_stop)(void *cb_arg);
 
 struct spdk_bs_dev_cb_args {
 	spdk_bs_dev_cpl		cb_fn;
@@ -761,6 +783,17 @@ bool spdk_blob_is_thin_provisioned(struct spdk_blob *blob);
 bool spdk_blob_is_esnap_clone(const struct spdk_blob *blob);
 
 /**
+ * Check if blob is locked.
+ *
+ * Tells if an operation is actually locking the blob.
+ *
+ * \param blob Blob.
+ *
+ * \return true if blob is locked.
+ */
+bool spdk_blob_is_locked(const struct spdk_blob *blob);
+
+/**
  * Delete an existing blob from the given blobstore.
  *
  * \param bs blobstore.
@@ -805,10 +838,85 @@ void spdk_bs_blob_decouple_parent(struct spdk_blob_store *bs, struct spdk_io_cha
 				  spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Detach from parent blob without modifying data.
+ *
+ * This call remove the dependencies of a blob from its parent snapshot without allocate any new
+ * cluster in the child blob, as for example it happens in decouple from parent. In this way
+ * blob's data are not modified.
+ *
+ * If blob have no parent, or if the parent is an external snapshot, -EINVAL error is reported.
+ *
+ * \param bs blobstore.
+ * \param blobid The id of the blob.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_blob_detach_parent(struct spdk_blob_store *bs, spdk_blob_id blobid,
+				spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
  * Perform a shallow copy of a blob to a blobstore device.
  *
  * This makes a shallow copy from a blob to a blobstore device.
  * Only clusters allocated to the blob will be written on the device.
+ * Blob must be read only and blob size must be less or equal than device size.
+ * Blobstore block size must be a multiple of device block size.
+
+ * \param bs Blobstore
+ * \param channel IO channel used to copy the blob.
+ * \param blobid The id of the blob.
+ * \param ext_dev The device to copy on
+ * \param pipeline_depth Maximum number of clusters in flight (0 = default 1).
+ *        Each in-flight slot holds a cluster-sized DMA buffer, so peak memory
+ *        usage is pipeline_depth * cluster_sz.
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+			      spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+			      uint32_t pipeline_depth,
+			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+			      spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Perform a ranged shallow copy of a blob to a blobstore device.
+ *
+ * This makes a synchronization of a range of data between a blob and a blobstore device, writing
+ * to the destination device the content of blob's allocated clusters and unmapping the content of
+ * destination device if a cluster is not allocated in the blob.
+ * Blob must be read only and the cluster range must fit into blob and device size.
+ * Blobstore block size must be a multiple of device block size.
+
+ * \param bs Blobstore
+ * \param channel IO channel used to copy the blob.
+ * \param blobid The id of the blob.
+ * \param clusters_indexes The array containing the indexes of the clusters to be synchronized.
+ * \param cluster_count The number of clusters into the index array.
+ * \param ext_dev The device to copy on
+ * \param pipeline_depth Maximum number of clusters in flight (0 = default 1).
+ *        Each in-flight slot holds a cluster-sized DMA buffer, so peak memory
+ *        usage is pipeline_depth * cluster_sz.
+ * \param status_cb_fn Called repeatedly during operation with status updates
+ * \param status_cb_arg Argument passed to function status_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ *
+ * \return 0 if operation starts correctly, negative errno on failure.
+ */
+int spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+				    spdk_blob_id blobid, uint64_t *clusters_indexes, uint64_t cluster_count,
+				    struct spdk_bs_dev *ext_dev, uint32_t pipeline_depth,
+				    spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				    spdk_blob_op_complete cb_fn, void *cb_arg);
+/**
+ * Perform a deep copy of a blob to a blobstore device.
+ *
+ * This makes a deep copy from a blob to a blobstore device.
+ * Clusters allocated to the blob or its parents will be written on the device.
  * Blob must be read only and blob size must be less or equal than device size.
  * Blobstore block size must be a multiple of device block size.
 
@@ -823,11 +931,10 @@ void spdk_bs_blob_decouple_parent(struct spdk_blob_store *bs, struct spdk_io_cha
  *
  * \return 0 if operation starts correctly, negative errno on failure.
  */
-int spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
-			      spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
-			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
-			      spdk_blob_op_complete cb_fn, void *cb_arg);
-
+int spdk_bs_blob_deep_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+			   spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+			   spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+			   spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Set a snapshot as the parent of a blob
@@ -866,6 +973,62 @@ void spdk_bs_blob_set_external_parent(struct spdk_blob_store *bs, spdk_blob_id b
 				      struct spdk_bs_dev *esnap_bs_dev, const void *esnap_id,
 				      uint32_t esnap_id_len, spdk_blob_op_complete cb_fn, void *cb_arg);
 
+
+/**
+ * Compute snapshot's checksum and store it as xattr
+ *
+ * This call compute a crc64 iso reflected checksum of snapshot's data and store it as an xattr.
+ * The snapshot must have the option to add new xattrs after its creation.
+ *
+ * \param bs Blobstore.
+ * \param blobid Id of blob.
+ * \param xattr_name Name of the extended attribute.
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+			       spdk_blob_id blob_id, const char *xattr_name,
+			       spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+			       spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Compute snapshot's whole and clusters checksums and store them in blob's metadata
+ *
+ * This call compute a crc64 iso reflected checksum of data for every cluster allocated to a
+ * snapshot and store these checksums in blob's metadata.
+ * It also computes the checksum of the whole blob and store it as an xattr, like spdk_bs_snapshot_checksum.
+ *
+ * \param bs Blobstore.
+ * \param blobid Id of blob.
+ * \param xattr_name Name of the extended attribute.
+ * \param stop_cb_fn Called repeatedly during operation to check if the operation must stop
+ * \param stop_cb_arg Argument passed to function stop_cb_fn.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs,
+		struct spdk_io_channel *channel, spdk_blob_id blob_id, const char *xattr_name,
+		spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+		spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Provide table with snapshot's clusters checksum in a specific range
+ *
+ * Checksums array must be allocated and its size must be greater than/equal to cluster_count,
+ * cluster_start_index must be less than blob's number of cluster,
+ * cluster_start_index + cluster_count must be less than/equal to blob's number of cluster.
+ *
+ * \param blob Blob to query.
+ * \param checksums Array of the checksums.
+ * \param cluster_start_index The index of the first cluster whose checksum must be retrieved.
+ * \param cluster_count The number of clusters whose checksums must be retrieved.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_bs_snapshot_get_range_checksum(struct spdk_blob *blob, uint64_t *checksums,
+					uint64_t cluster_start_index, uint64_t cluster_count);
 
 struct spdk_blob_open_opts {
 	enum blob_clear_method  clear_method;

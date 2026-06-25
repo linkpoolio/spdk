@@ -10,11 +10,38 @@
 #include "spdk/string.h"
 #include "spdk/uuid.h"
 #include "spdk/blob.h"
+#include "spdk/bit_array.h"
+#include "spdk/base64.h"
 
 #include "vbdev_lvol.h"
 
+struct freeze_range {
+	struct spdk_lvol		*lvol;
+	uint64_t			offset;
+	uint64_t			length;
+	void				*freezed_ctx;
+	struct spdk_thread		*owner_thread;
+	struct spdk_io_channel		*owner_ch;
+	TAILQ_ENTRY(freeze_range)	tailq;
+};
+
+struct spdk_lvol_channel {
+	/* The channel for the underlying blobstore device */
+	struct spdk_io_channel		*bs_channel;
+
+	/* List of submitted I/O that are currently running */
+	TAILQ_HEAD(, vbdev_lvol_io)	submitted_io;
+
+	/* List of I/O that are currently queued because they write to a frozen range */
+	TAILQ_HEAD(, vbdev_lvol_io)	queued_io;
+
+	/* List of ranges actually freezed */
+	lvol_freeze_range_tailq_t	freezed_ranges;
+};
+
 struct vbdev_lvol_io {
 	struct spdk_blob_ext_io_opts ext_io_opts;
+	TAILQ_ENTRY(vbdev_lvol_io) link;
 };
 
 static TAILQ_HEAD(, lvol_store_bdev) g_spdk_lvol_pairs = TAILQ_HEAD_INITIALIZER(
@@ -25,6 +52,11 @@ static void vbdev_lvs_fini_start(void);
 static int vbdev_lvs_get_ctx_size(void);
 static void vbdev_lvs_examine_config(struct spdk_bdev *bdev);
 static void vbdev_lvs_examine_disk(struct spdk_bdev *bdev);
+static int _vbdev_lvol_quiesce(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io,
+			       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+static int _vbdev_lvol_unquiesce(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io,
+				 spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
 static bool g_shutdown_started = false;
 
 static struct spdk_bdev_module g_lvol_if = {
@@ -115,6 +147,87 @@ _vbdev_lvol_change_bdev_alias(struct spdk_lvol *lvol, const char *new_lvol_name)
 	}
 
 	return 0;
+}
+
+static void
+vbdev_lvol_channel_destroy_resource(struct spdk_lvol_channel *ch)
+{
+	struct freeze_range *range;
+
+	while (!TAILQ_EMPTY(&ch->freezed_ranges)) {
+		range = TAILQ_FIRST(&ch->freezed_ranges);
+		TAILQ_REMOVE(&ch->freezed_ranges, range, tailq);
+		free(range);
+	}
+
+	spdk_put_io_channel(ch->bs_channel);
+
+	assert(TAILQ_EMPTY(&ch->queued_io));
+	assert(TAILQ_EMPTY(&ch->submitted_io));
+}
+
+static int
+vbdev_lvol_channel_create(void *io_device, void *ctx_buf)
+{
+	struct spdk_lvol		*lvol = io_device;
+	struct spdk_lvol_channel	*channel = ctx_buf;
+	struct freeze_range		*range;
+
+	channel->bs_channel = spdk_lvol_get_io_channel(lvol);
+	TAILQ_INIT(&channel->submitted_io);
+	TAILQ_INIT(&channel->queued_io);
+	TAILQ_INIT(&channel->freezed_ranges);
+
+	spdk_spin_lock(&lvol->spinlock);
+	TAILQ_FOREACH(range, &lvol->freezed_ranges, tailq) {
+		struct freeze_range *new_range;
+
+		new_range = calloc(1, sizeof(*new_range));
+		if (new_range == NULL) {
+			spdk_spin_unlock(&lvol->spinlock);
+			vbdev_lvol_channel_destroy_resource(channel);
+			return -1;
+		}
+		new_range->offset = range->offset;
+		new_range->length = range->length;
+		new_range->freezed_ctx = range->freezed_ctx;
+		TAILQ_INSERT_TAIL(&channel->freezed_ranges, new_range, tailq);
+	}
+	spdk_spin_unlock(&lvol->spinlock);
+
+	return 0;
+}
+
+static void
+vbdev_lvol_channel_destroy(void *io_device, void *ctx_buf)
+{
+	struct spdk_lvol_channel *channel = ctx_buf;
+
+	vbdev_lvol_channel_destroy_resource(channel);
+}
+
+static int
+vbdev_lvol_register(struct spdk_lvol *lvol, struct spdk_bdev *lvol_bdev)
+{
+	int rc;
+
+	/* We must register lvol as io_device before to register lvol bdev */
+	spdk_io_device_register(lvol, vbdev_lvol_channel_create, vbdev_lvol_channel_destroy,
+				sizeof(struct spdk_lvol_channel), "lvol");
+
+	rc = spdk_bdev_register(lvol_bdev);
+	if (rc) {
+		spdk_io_device_unregister(lvol, NULL);
+	}
+
+	return rc;
+}
+
+static void
+vbdev_lvol_unregister(struct spdk_lvol *lvol, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
+{
+	spdk_io_device_unregister(lvol, NULL);
+	spdk_bdev_unregister(lvol->bdev, cb_fn, cb_arg);
 }
 
 static struct lvol_store_bdev *
@@ -580,7 +693,7 @@ struct vbdev_lvol_destroy_ctx {
 };
 
 static void
-_vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
+_vbdev_lvol_destruct_unload_lvs(void *cb_arg, int lvserrno)
 {
 	struct lvol_bdev *lvol_bdev = cb_arg;
 	struct lvol_store_bdev *lvs_bdev = lvol_bdev->lvs_bdev;
@@ -597,13 +710,15 @@ _vbdev_lvol_unregister_unload_lvs(void *cb_arg, int lvserrno)
 }
 
 static void
-_vbdev_lvol_unregister_cb(void *ctx, int lvolerrno)
+_vbdev_lvol_destruct_cb(void *ctx, int lvolerrno)
 {
 	struct lvol_bdev *lvol_bdev = ctx;
 	struct lvol_store_bdev *lvs_bdev = lvol_bdev->lvs_bdev;
 
+	spdk_io_device_unregister(lvol_bdev->lvol, NULL);
+
 	if (g_shutdown_started && _vbdev_lvs_are_lvols_closed(lvs_bdev->lvs)) {
-		spdk_lvs_unload(lvs_bdev->lvs, _vbdev_lvol_unregister_unload_lvs, lvol_bdev);
+		spdk_lvs_unload(lvs_bdev->lvs, _vbdev_lvol_destruct_unload_lvs, lvol_bdev);
 		return;
 	}
 
@@ -612,7 +727,7 @@ _vbdev_lvol_unregister_cb(void *ctx, int lvolerrno)
 }
 
 static int
-vbdev_lvol_unregister(void *ctx)
+vbdev_lvol_destruct(void *ctx)
 {
 	struct spdk_lvol *lvol = ctx;
 	struct lvol_bdev *lvol_bdev;
@@ -620,7 +735,7 @@ vbdev_lvol_unregister(void *ctx)
 	assert(lvol != NULL);
 	lvol_bdev = SPDK_CONTAINEROF(lvol->bdev, struct lvol_bdev, bdev);
 
-	spdk_lvol_close(lvol, _vbdev_lvol_unregister_cb, lvol_bdev);
+	spdk_lvol_close(lvol, _vbdev_lvol_destruct_cb, lvol_bdev);
 
 	/* return 1 to indicate we have an operation that must finish asynchronously before the
 	 *  lvol is closed
@@ -703,6 +818,13 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 
+	/* Check if blob is locked by another operation */
+	if (spdk_blob_is_locked(lvol->blob)) {
+		SPDK_ERRLOG("Cannot delete lvol %s, blob is locked\n", lvol->name);
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
 	_vbdev_lvol_destroy(lvol, cb_fn, cb_arg);
 }
 
@@ -757,6 +879,8 @@ vbdev_lvol_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	blob = lvol->blob;
 
 	spdk_json_write_named_bool(w, "thin_provision", spdk_blob_is_thin_provisioned(blob));
+
+	spdk_json_write_named_uint64(w, "num_clusters", spdk_blob_get_num_clusters(blob));
 
 	spdk_json_write_named_uint64(w, "num_allocated_clusters",
 				     spdk_blob_get_num_allocated_clusters(blob));
@@ -834,9 +958,7 @@ vbdev_lvol_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx 
 static struct spdk_io_channel *
 vbdev_lvol_get_io_channel(void *ctx)
 {
-	struct spdk_lvol *lvol = ctx;
-
-	return spdk_lvol_get_io_channel(lvol);
+	return spdk_get_io_channel(ctx);
 }
 
 static bool
@@ -853,6 +975,7 @@ vbdev_lvol_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_READ:
 	case SPDK_BDEV_IO_TYPE_SEEK_DATA:
 	case SPDK_BDEV_IO_TYPE_SEEK_HOLE:
+	case SPDK_BDEV_IO_TYPE_FLUSH:
 		return true;
 	default:
 		return false;
@@ -864,6 +987,8 @@ lvol_op_comp(void *cb_arg, int bserrno)
 {
 	struct spdk_bdev_io *bdev_io = cb_arg;
 	enum spdk_bdev_io_status status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	struct spdk_io_channel *channel = spdk_bdev_io_get_io_channel(bdev_io);
+	struct spdk_lvol_channel *lvol_channel = spdk_io_channel_get_ctx(channel);
 
 	if (bserrno != 0) {
 		if (bserrno == -ENOMEM) {
@@ -872,6 +997,8 @@ lvol_op_comp(void *cb_arg, int bserrno)
 			status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
 	}
+
+	TAILQ_REMOVE(&lvol_channel->submitted_io, (struct vbdev_lvol_io *)bdev_io->driver_ctx, link);
 
 	spdk_bdev_io_complete(bdev_io, status);
 }
@@ -894,7 +1021,7 @@ lvol_seek_data(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io)
 	bdev_io->u.bdev.seek.offset = spdk_blob_get_next_allocated_io_unit(lvol->blob,
 				      bdev_io->u.bdev.offset_blocks);
 
-	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	lvol_op_comp(bdev_io, 0);
 }
 
 static void
@@ -903,7 +1030,7 @@ lvol_seek_hole(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io)
 	bdev_io->u.bdev.seek.offset = spdk_blob_get_next_unallocated_io_unit(lvol->blob,
 				      bdev_io->u.bdev.offset_blocks);
 
-	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	lvol_op_comp(bdev_io, 0);
 }
 
 static void
@@ -958,7 +1085,7 @@ lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_
 static int
 lvol_reset(struct spdk_bdev_io *bdev_io)
 {
-	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	lvol_op_comp(bdev_io, -EPERM);
 
 	return 0;
 }
@@ -966,18 +1093,118 @@ lvol_reset(struct spdk_bdev_io *bdev_io)
 static void
 lvol_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
 {
+	struct spdk_lvol_channel *lvol_ch = (struct spdk_lvol_channel *)spdk_io_channel_get_ctx(ch);
+
 	if (!success) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
-	lvol_read(ch, bdev_io);
+	lvol_read(lvol_ch->bs_channel, bdev_io);
+}
+
+static void
+lvol_flush_unquiesce_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+{
+	struct spdk_bdev_io *bdev_io = cb_arg;
+
+	lvol_op_comp(bdev_io, 0);
+}
+
+static void
+lvol_flush_quiesce_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+{
+	struct spdk_bdev_io *bdev_io = cb_arg;
+	int rt;
+
+	if (lvolerrno != 0) {
+		lvol_op_comp(bdev_io, lvolerrno);
+	}
+
+	rt = _vbdev_lvol_unquiesce(lvol, bdev_io, lvol_flush_unquiesce_cb, bdev_io);
+	if (rt != 0) {
+		lvol_op_comp(bdev_io, rt);
+	}
+}
+
+static void
+lvol_flush(struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	int rt;
+
+	rt = _vbdev_lvol_quiesce(lvol, bdev_io, lvol_flush_quiesce_cb, bdev_io);
+	if (rt != 0) {
+		lvol_op_comp(bdev_io, rt);
+	}
+}
+
+static bool
+lvol_freeze_range_overlapped(struct freeze_range *range1, struct freeze_range *range2)
+{
+	if (range1->length == 0 || range2->length == 0) {
+		return false;
+	}
+
+	if (range1->offset + range1->length <= range2->offset) {
+		return false;
+	}
+
+	if (range2->offset + range2->length <= range1->offset) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+bdev_io_range_is_freezed(struct spdk_bdev_io *bdev_io, struct freeze_range *range)
+{
+	struct spdk_io_channel *channel = spdk_bdev_io_get_io_channel(bdev_io);
+	struct freeze_range r;
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		r.offset = bdev_io->u.bdev.offset_blocks;
+		r.length = bdev_io->u.bdev.num_blocks;
+		if (!lvol_freeze_range_overlapped(range, &r)) {
+			/* This I/O doesn't overlap the specified freezed range. */
+			return false;
+		} else if (range->owner_ch == channel && range->freezed_ctx == bdev_io->internal.caller_ctx) {
+			/* This I/O overlaps, but the I/O is on the same channel that freezed this
+			 * range, and the caller_ctx is the same as the freezed_ctx.  This means
+			 * that this I/O is associated with the freeze, and is allowed to execute.
+			 */
+			return false;
+		} else {
+			return true;
+		}
+	default:
+		return false;
+	}
 }
 
 static void
 vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_channel *lvol_ch = (struct spdk_lvol_channel *)spdk_io_channel_get_ctx(ch);
+
+	if (!TAILQ_EMPTY(&lvol_ch->freezed_ranges)) {
+		struct freeze_range *range;
+
+		TAILQ_FOREACH(range, &lvol_ch->freezed_ranges, tailq) {
+			if (bdev_io_range_is_freezed(bdev_io, range)) {
+				TAILQ_INSERT_TAIL(&lvol_ch->queued_io, lvol_io, link);
+				return;
+			}
+		}
+	}
+
+	TAILQ_INSERT_TAIL(&lvol_ch->submitted_io, lvol_io, link);
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -985,16 +1212,19 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		lvol_write(lvol, ch, bdev_io);
+		lvol_write(lvol, lvol_ch->bs_channel, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		lvol_flush(bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
 		lvol_reset(bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_UNMAP:
-		lvol_unmap(lvol, ch, bdev_io);
+		lvol_unmap(lvol, lvol_ch->bs_channel, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
-		lvol_write_zeroes(lvol, ch, bdev_io);
+		lvol_write_zeroes(lvol, lvol_ch->bs_channel, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_SEEK_DATA:
 		lvol_seek_data(lvol, bdev_io);
@@ -1107,7 +1337,7 @@ vbdev_lvol_get_memory_domain_types(void *ctx, enum spdk_dma_device_type *types, 
 }
 
 static struct spdk_bdev_fn_table vbdev_lvol_fn_table = {
-	.destruct		= vbdev_lvol_unregister,
+	.destruct		= vbdev_lvol_destruct,
 	.io_type_supported	= vbdev_lvol_io_type_supported,
 	.submit_request		= vbdev_lvol_submit_request,
 	.get_io_channel		= vbdev_lvol_get_io_channel,
@@ -1192,6 +1422,7 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
 	assert((total_size % bdev->blocklen) == 0);
 	bdev->blockcnt = total_size / bdev->blocklen;
 	bdev->uuid = lvol->uuid;
+	bdev->creation_time = lvol->creation_time;
 	bdev->required_alignment = lvs_bdev->bdev->required_alignment;
 	bdev->split_on_optimal_io_boundary = true;
 	bdev->optimal_io_boundary = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / bdev->blocklen;
@@ -1210,7 +1441,7 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
 	 * bdev that may be used by multiple lvols. */
 	bdev->reset_io_drain_timeout = SPDK_BDEV_RESET_IO_DRAIN_RECOMMENDED_VALUE;
 
-	rc = spdk_bdev_register(bdev);
+	rc = vbdev_lvol_register(lvol, bdev);
 	if (rc) {
 		free(lvol_bdev);
 		return rc;
@@ -1220,16 +1451,16 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
 	alias = spdk_sprintf_alloc("%s/%s", lvs_bdev->lvs->name, lvol->name);
 	if (alias == NULL) {
 		SPDK_ERRLOG("Cannot alloc memory for alias\n");
-		spdk_bdev_unregister(lvol->bdev, (destroy ? _create_lvol_disk_destroy_cb :
-						  _create_lvol_disk_unload_cb), lvol);
+		vbdev_lvol_unregister(lvol, (destroy ? _create_lvol_disk_destroy_cb :
+					     _create_lvol_disk_unload_cb), lvol);
 		return -ENOMEM;
 	}
 
 	rc = spdk_bdev_alias_add(bdev, alias);
 	if (rc != 0) {
 		SPDK_ERRLOG("Cannot add alias to lvol bdev\n");
-		spdk_bdev_unregister(lvol->bdev, (destroy ? _create_lvol_disk_destroy_cb :
-						  _create_lvol_disk_unload_cb), lvol);
+		vbdev_lvol_unregister(lvol, (destroy ? _create_lvol_disk_destroy_cb :
+					     _create_lvol_disk_unload_cb), lvol);
 	}
 	free(alias);
 
@@ -1278,6 +1509,7 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 
 void
 vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+			   const char *const *xattrs, size_t xattrs_num,
 			   spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
@@ -1291,7 +1523,15 @@ vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	spdk_lvol_create_snapshot(lvol, snapshot_name, _vbdev_lvol_create_cb, req);
+	if (xattrs == NULL && xattrs_num == 0) {
+		spdk_lvol_create_snapshot(lvol, snapshot_name, _vbdev_lvol_create_cb, req);
+	} else if (xattrs != NULL && xattrs_num > 0) {
+		spdk_lvol_create_snapshot_with_xattrs(lvol, snapshot_name, xattrs, xattrs_num,
+						      _vbdev_lvol_create_cb, req);
+	} else {
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
 }
 
 void
@@ -1408,6 +1648,43 @@ vbdev_lvol_rename(struct spdk_lvol *lvol, const char *new_lvol_name,
 	req->cb_arg = cb_arg;
 
 	spdk_lvol_rename(lvol, new_lvol_name, _vbdev_lvol_rename_cb, req);
+}
+
+static void
+_vbdev_lvol_set_xattr_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Setting xattr failed: error %d\n", lvolerrno);
+	}
+
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+void
+vbdev_lvol_set_xattr(struct spdk_lvol *lvol, const char *name,
+		     const char *value, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	spdk_lvol_set_xattr(lvol, name, value, _vbdev_lvol_set_xattr_cb, req);
+}
+
+int
+vbdev_lvol_get_xattr(struct spdk_lvol *lvol, const char *name,
+		     const void **value, size_t *value_len)
+{
+	return spdk_lvol_get_xattr(lvol, name, value, value_len);
 }
 
 static void
@@ -1928,6 +2205,11 @@ vbdev_lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob
 	int			rc;
 	char			uuid_str[SPDK_UUID_STRING_LEN] = { 0 };
 
+	if (lvol == NULL) {
+		SPDK_NOTICELOG("Skip esnap device creation for NULL lvol\n");
+		return 0;
+	}
+
 	if (esnap_id == NULL) {
 		SPDK_ERRLOG("lvol %s: NULL esnap ID\n", lvol->unique_id);
 		return -EINVAL;
@@ -2019,6 +2301,7 @@ _vbdev_lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 
 int
 vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			uint32_t pipeline_depth,
 			spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2065,8 +2348,151 @@ vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 	req->lvol = lvol;
 	req->ext_dev = ext_dev;
 
-	rc = spdk_lvol_shallow_copy(lvol, ext_dev, status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb,
-				    req);
+	rc = spdk_lvol_shallow_copy(lvol, ext_dev, pipeline_depth,
+				    status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb, req);
+
+	if (rc < 0) {
+		ext_dev->destroy(ext_dev);
+		free(req);
+	}
+
+	return rc;
+}
+
+int
+vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			      uint64_t *clusters_indexes, uint64_t cluster_count,
+			      uint32_t pipeline_depth,
+			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+			      spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_dev *ext_dev;
+	struct spdk_lvol_copy_req *req;
+	int rc;
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol must not be NULL\n");
+		return -EINVAL;
+	}
+
+	if (bdev_name == NULL) {
+		SPDK_ERRLOG("lvol %s, bdev name must not be NULL\n", lvol->name);
+		return -EINVAL;
+	}
+
+	assert(lvol->bdev != NULL);
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("lvol %s, cannot alloc memory for lvol copy request\n", lvol->name);
+		return -ENOMEM;
+	}
+
+	rc = spdk_bdev_create_bs_dev_ext(bdev_name, _vbdev_lvol_shallow_copy_base_bdev_event_cb,
+					 NULL, &ext_dev);
+	if (rc < 0) {
+		SPDK_ERRLOG("lvol %s, cannot create blobstore block device from bdev %s\n", lvol->name, bdev_name);
+		free(req);
+		return rc;
+	}
+
+	rc = spdk_bs_bdev_claim(ext_dev, &g_lvol_if);
+	if (rc != 0) {
+		SPDK_ERRLOG("lvol %s, unable to claim bdev %s, error %d\n", lvol->name, bdev_name, rc);
+		ext_dev->destroy(ext_dev);
+		free(req);
+		return rc;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+	req->ext_dev = ext_dev;
+
+	rc = spdk_lvol_range_shallow_copy(lvol, clusters_indexes, cluster_count, ext_dev,
+					  pipeline_depth,
+					  status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb, req);
+
+	if (rc < 0) {
+		ext_dev->destroy(ext_dev);
+		free(req);
+	}
+
+	return rc;
+}
+
+static void
+_vbdev_lvol_deep_copy_base_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+		void *event_ctx)
+{
+}
+
+static void
+_vbdev_lvol_deep_copy_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_copy_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;
+
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Could not make a deep copy of lvol %s due to error: %d\n",
+			    lvol->name, lvolerrno);
+	}
+
+	req->ext_dev->destroy(req->ext_dev);
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+int
+vbdev_lvol_deep_copy(struct spdk_lvol *lvol, const char *bdev_name,
+		     spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+		     spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_dev *ext_dev;
+	struct spdk_lvol_copy_req *req;
+	int rc;
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol must not be NULL\n");
+		return -EINVAL;
+	}
+
+	if (bdev_name == NULL) {
+		SPDK_ERRLOG("lvol %s, bdev name must not be NULL\n", lvol->name);
+		return -EINVAL;
+	}
+
+	assert(lvol->bdev != NULL);
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("lvol %s, cannot alloc memory for lvol copy request\n", lvol->name);
+		return -ENOMEM;
+	}
+
+	rc = spdk_bdev_create_bs_dev_ext(bdev_name, _vbdev_lvol_deep_copy_base_bdev_event_cb,
+					 NULL, &ext_dev);
+	if (rc < 0) {
+		SPDK_ERRLOG("lvol %s, cannot create blobstore device from bdev %s\n", lvol->name, bdev_name);
+		free(req);
+		return rc;
+	}
+
+	rc = spdk_bs_bdev_claim(ext_dev, &g_lvol_if);
+	if (rc != 0) {
+		SPDK_ERRLOG("lvol %s, unable to claim bdev %s, error %d\n", lvol->name, bdev_name, rc);
+		ext_dev->destroy(ext_dev);
+		free(req);
+		return rc;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+	req->ext_dev = ext_dev;
+
+	rc = spdk_lvol_deep_copy(lvol, ext_dev, status_cb_fn, status_cb_arg, _vbdev_lvol_deep_copy_cb,
+				 req);
 
 	if (rc < 0) {
 		ext_dev->destroy(ext_dev);
@@ -2112,6 +2538,510 @@ vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
 	spdk_lvol_set_external_parent(lvol, bdev_uuid, sizeof(bdev_uuid), cb_fn, cb_arg);
 
 	spdk_bdev_close(desc);
+}
+
+static void seek_hole_done_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+
+static void
+get_fragmap_done(struct spdk_fragmap_req *req, int error_code, const char *error_msg)
+{
+	req->cb_fn(req->cb_arg, &req->fragmap, error_code);
+
+	spdk_bit_array_free(&req->fragmap.map);
+	spdk_put_io_channel(req->bdev_io_channel);
+	spdk_bdev_close(req->bdev_desc);
+	free(req);
+}
+
+static void
+seek_data_done_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_fragmap_req *req = cb_arg;
+	uint64_t next_data_offset_blocks;
+	int rc;
+
+	next_data_offset_blocks = spdk_bdev_io_get_seek_offset(bdev_io);
+	spdk_bdev_free_io(bdev_io);
+
+	req->current_offset = next_data_offset_blocks * req->fragmap.block_size;
+
+	if (next_data_offset_blocks == UINT64_MAX || req->current_offset >= req->offset + req->size) {
+		get_fragmap_done(req, 0, NULL);
+		return;
+	}
+
+	rc = spdk_bdev_seek_hole(req->bdev_desc, req->bdev_io_channel,
+				 spdk_divide_round_up(req->current_offset, req->fragmap.block_size),
+				 seek_hole_done_cb, req);
+	if (rc != 0) {
+		get_fragmap_done(req, rc, "failed to seek hole");
+	}
+}
+
+static void
+seek_hole_done_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_fragmap_req *req = cb_arg;
+	uint64_t next_offset;
+	uint64_t start_cluster;
+	uint64_t num_clusters;
+	int rc;
+
+	next_offset = spdk_bdev_io_get_seek_offset(bdev_io) * req->fragmap.block_size;
+	spdk_bdev_free_io(bdev_io);
+
+	next_offset = spdk_min(next_offset, req->offset + req->size);
+
+	start_cluster = spdk_divide_round_up(req->current_offset - req->offset, req->fragmap.cluster_size);
+	num_clusters = spdk_divide_round_up(next_offset - req->current_offset, req->fragmap.cluster_size);
+
+	for (uint64_t i = 0; i < num_clusters; i++) {
+		spdk_bit_array_set(req->fragmap.map, start_cluster + i);
+	}
+	req->fragmap.num_allocated_clusters += num_clusters;
+
+	req->current_offset = next_offset;
+
+	if (req->current_offset == req->offset + req->size) {
+		get_fragmap_done(req, 0, NULL);
+		return;
+	}
+
+	rc = spdk_bdev_seek_data(req->bdev_desc, req->bdev_io_channel,
+				 spdk_divide_round_up(req->current_offset, req->fragmap.block_size),
+				 seek_data_done_cb, req);
+	if (rc != 0) {
+		get_fragmap_done(req, rc, "failed to seek data");
+	}
+}
+
+static void
+dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
+{
+}
+
+void
+vbdev_lvol_get_fragmap(struct spdk_lvol *lvol, uint64_t offset, uint64_t size,
+		       spdk_lvol_op_with_fragmap_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *channel;
+	struct spdk_bit_array *fragmap;
+	struct spdk_fragmap_req *req;
+	uint64_t cluster_size, num_clusters, block_size, num_blocks, lvol_size, segment_size;
+	int rc;
+
+	/*
+	 * Create a bitmap recording the allocated clusters
+	 */
+	cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
+	block_size = spdk_bdev_get_block_size(lvol->bdev);
+	num_blocks = spdk_bdev_get_num_blocks(lvol->bdev);
+	lvol_size = num_blocks * block_size;
+
+	if (offset + size > lvol_size) {
+		SPDK_ERRLOG("offset %lu and size %lu exceed lvol size %lu\n",
+			    offset, size, lvol_size);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	segment_size = size;
+	if (size == 0) {
+		segment_size = lvol_size;
+	}
+
+	if (!spdk_is_divisible_by(offset, cluster_size) ||
+	    !spdk_is_divisible_by(segment_size, cluster_size)) {
+		SPDK_ERRLOG("offset %lu and size %lu must be a multiple of cluster size %lu\n",
+			    offset, segment_size, cluster_size);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	num_clusters = spdk_divide_round_up(segment_size, cluster_size);
+	fragmap = spdk_bit_array_create(num_clusters);
+	if (fragmap == NULL) {
+		SPDK_ERRLOG("failed to allocate fragmap with num_clusters %lu\n", num_clusters);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	/*
+	 * Construct a fragmap of the lvol
+	 */
+	rc = spdk_bdev_open_ext(lvol->bdev->name, false,
+				dummy_bdev_event_cb, NULL, &desc);
+	if (rc != 0) {
+		spdk_bit_array_free(&fragmap);
+		SPDK_ERRLOG("could not open bdev %s\n", lvol->bdev->name);
+		cb_fn(cb_arg, NULL, rc);
+		return;
+	}
+
+	channel = spdk_bdev_get_io_channel(desc);
+	if (channel == NULL) {
+		spdk_bit_array_free(&fragmap);
+		spdk_bdev_close(desc);
+		SPDK_ERRLOG("could not allocate I/O channel.\n");
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	req = calloc(1, sizeof(struct spdk_fragmap_req));
+	if (req == NULL) {
+		SPDK_ERRLOG("could not allocate fragmap_io\n");
+		spdk_put_io_channel(channel);
+		spdk_bdev_close(desc);
+		spdk_bit_array_free(&fragmap);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	req->bdev = lvol->bdev;
+	req->bdev_desc = desc;
+	req->bdev_io_channel = channel;
+	req->offset = offset;
+	req->size = segment_size;
+	req->current_offset = offset;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->fragmap.map = fragmap;
+	req->fragmap.num_clusters = num_clusters;
+	req->fragmap.block_size = block_size;
+	req->fragmap.cluster_size = cluster_size;
+	req->fragmap.num_allocated_clusters = 0;
+
+	rc = spdk_bdev_seek_data(desc, channel,
+				 spdk_divide_round_up(offset, block_size),
+				 seek_data_done_cb, req);
+	if (rc != 0) {
+		SPDK_ERRLOG("failed to seek data\n");
+		spdk_put_io_channel(channel);
+		spdk_bdev_close(desc);
+		spdk_bit_array_free(&fragmap);
+		free(req);
+		cb_fn(cb_arg, NULL, rc);
+	}
+}
+
+struct quiesce_lvol_ctx {
+	struct freeze_range			range;
+	struct freeze_range			*current_range;
+	struct spdk_poller			*poller;
+	spdk_lvol_op_with_handle_complete	cb_fn;
+	void					*cb_arg;
+};
+
+static void
+_vbdev_lvol_quiesce_error_cleanup_cb(struct spdk_io_channel_iter *i, int status)
+{
+	struct quiesce_lvol_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	ctx->cb_fn(ctx->cb_arg, ctx->range.lvol, -ENOMEM);
+	free(ctx);
+}
+
+static void _vbdev_lvol_unquiesce_get_channel(struct spdk_io_channel_iter *i);
+
+static void
+_vbdev_lvol_quiesce_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct quiesce_lvol_ctx	*ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_lvol	*lvol = ctx->range.lvol;
+
+	if (status == -ENOMEM) {
+		/*
+		 * One of the channels could not allocate a freeze_range object.
+		 * So we have to go back and clean up any freeze_range that were
+		 * allocated successfully before we return error status to
+		 * the caller. We can reuse the unquiesce function to do that
+		 * clean up.
+		 */
+		SPDK_ERRLOG("Error %d executing quiesce on lvol %s\n", status, lvol->name);
+		spdk_for_each_channel(lvol, _vbdev_lvol_unquiesce_get_channel, ctx,
+				      _vbdev_lvol_quiesce_error_cleanup_cb);
+		return;
+	}
+
+	/* All channels have freezed this range and no I/O are outstanding */
+	ctx->cb_fn(ctx->cb_arg, ctx->range.lvol, status);
+
+	/* Don't free the ctx here. Its range is in the lvol's global list of
+	 * freezed ranges, and will be removed and freed when this range
+	 * is later unfrozen.
+	 */
+}
+
+static int
+_vbdev_lvol_quiesce_check_io(void *_i)
+{
+	struct spdk_io_channel_iter	*i = _i;
+	struct quiesce_lvol_ctx		*ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel		*channel = spdk_io_channel_iter_get_channel(i);
+	struct spdk_lvol_channel	*lvol_channel = spdk_io_channel_get_ctx(channel);
+	struct freeze_range		*range = ctx->current_range;
+	struct spdk_bdev_io		*bdev_io;
+	struct vbdev_lvol_io		*lvol_io;
+
+	spdk_poller_unregister(&ctx->poller);
+
+	/*
+	 * The range is now freezed, so no new IO can be submitted to it.
+	 * But we need to wait until any outstanding I/O overlapping with this range are completed,
+	 * skipping the current I/O in case the quiesce operation is started by a bdev_io flush request.
+	 */
+	TAILQ_FOREACH(lvol_io, &lvol_channel->submitted_io, link) {
+		bdev_io = spdk_bdev_io_from_ctx(lvol_io);
+		if (bdev_io_range_is_freezed(bdev_io, range)) {
+			ctx->poller = SPDK_POLLER_REGISTER(_vbdev_lvol_quiesce_check_io, i, 100);
+			return SPDK_POLLER_BUSY;
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+_vbdev_lvol_quiesce_get_channel(struct spdk_io_channel_iter *i)
+{
+	struct quiesce_lvol_ctx		*ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel		*channel = spdk_io_channel_iter_get_channel(i);
+	struct spdk_lvol_channel	*lvol_channel = spdk_io_channel_get_ctx(channel);
+	struct freeze_range		*range;
+
+	TAILQ_FOREACH(range, &lvol_channel->freezed_ranges, tailq) {
+		if (range->offset == ctx->range.offset &&
+		    range->length == ctx->range.length &&
+		    range->freezed_ctx == ctx->range.freezed_ctx) {
+			/* This range already exists on this channel, so don't add
+			 * it again.  This can happen when a new channel is created
+			 * while the for_each_channel operation is in progress.
+			 * Do not check for outstanding I/O in that case, since the
+			 * range was freezed before any I/O could be submitted to the
+			 * new channel.
+			 */
+			spdk_for_each_channel_continue(i, 0);
+			return;
+		}
+	}
+
+	range = calloc(1, sizeof(*range));
+	if (range == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for range quiesce channel of lvol %s\n",
+			    ctx->range.lvol->name);
+		spdk_for_each_channel_continue(i, -ENOMEM);
+		return;
+	}
+
+	range->offset = ctx->range.offset;
+	range->length = ctx->range.length;
+	range->freezed_ctx = ctx->range.freezed_ctx;
+	range->owner_ch = ctx->range.owner_ch;
+	ctx->current_range = range;
+	TAILQ_INSERT_TAIL(&lvol_channel->freezed_ranges, range, tailq);
+
+	_vbdev_lvol_quiesce_check_io(i);
+}
+
+static void
+_vbdev_lvol_quiesce_ctx(struct spdk_lvol *lvol, struct quiesce_lvol_ctx *ctx)
+{
+	assert(spdk_get_thread() == ctx->range.owner_thread);
+	assert(ctx->range.owner_ch == NULL ||
+	       spdk_io_channel_get_thread(ctx->range.owner_ch) == ctx->range.owner_thread);
+
+	/* We will add a copy of this range to each channel now. */
+	spdk_for_each_channel(lvol, _vbdev_lvol_quiesce_get_channel, ctx, _vbdev_lvol_quiesce_done);
+}
+
+static bool
+lvol_freeze_range_overlaps_tailq(struct freeze_range *range, lvol_freeze_range_tailq_t *tailq)
+{
+	struct freeze_range *r;
+
+	TAILQ_FOREACH(r, tailq, tailq) {
+		if (lvol_freeze_range_overlapped(range, r)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static int
+_vbdev_lvol_quiesce(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io,
+		    spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct quiesce_lvol_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for context quiesce of lvol %s\n", lvol->name);
+		return -ENOMEM;
+	}
+
+	ctx->range.lvol = lvol;
+	ctx->range.owner_thread = spdk_get_thread();
+	if (bdev_io != NULL) {
+		ctx->range.offset = bdev_io->u.bdev.offset_blocks;
+		ctx->range.length = bdev_io->u.bdev.num_blocks;
+		ctx->range.freezed_ctx = bdev_io->internal.caller_ctx;
+		ctx->range.owner_ch =  spdk_bdev_io_get_io_channel(bdev_io);
+	} else {
+		ctx->range.offset = 0;
+		ctx->range.length = lvol->bdev->blockcnt;
+	}
+
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	spdk_spin_lock(&lvol->spinlock);
+	if (lvol_freeze_range_overlaps_tailq(&ctx->range, &lvol->freezed_ranges)) {
+		/*
+		 * There is an active freezed range overlapping with this range.
+		 * Put it on the pending list until this range no
+		 * longer overlaps with another.
+		 */
+		TAILQ_INSERT_TAIL(&lvol->pending_freezed_ranges, &ctx->range, tailq);
+	} else {
+		TAILQ_INSERT_TAIL(&lvol->freezed_ranges, &ctx->range, tailq);
+		_vbdev_lvol_quiesce_ctx(lvol, ctx);
+	}
+	spdk_spin_unlock(&lvol->spinlock);
+
+	return 0;
+}
+
+static void
+_vbdev_lvol_quiesce_ctx_msg(void *_ctx)
+{
+	struct quiesce_lvol_ctx *ctx = _ctx;
+
+	_vbdev_lvol_quiesce_ctx(ctx->range.lvol, ctx);
+}
+
+static void
+_vbdev_lvol_unquiesce_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct quiesce_lvol_ctx	*ctx = spdk_io_channel_iter_get_ctx(i);
+	struct quiesce_lvol_ctx	*queued_ctx;
+	struct spdk_lvol	*lvol = ctx->range.lvol;
+	struct freeze_range	*range, *tmp;
+
+	spdk_spin_lock(&lvol->spinlock);
+	/* Check if there are any pending freezed ranges that overlap with this range
+	 * that was just unfreezed. If there are, check that it doesn't overlap with any
+	 * other freezed ranges before calling _vbdev_lvol_quiesce_ctx which will start
+	 * the quiesce process.
+	 */
+	TAILQ_FOREACH_SAFE(range, &lvol->pending_freezed_ranges, tailq, tmp) {
+		if (lvol_freeze_range_overlapped(range, &ctx->range) &&
+		    !lvol_freeze_range_overlaps_tailq(range, &lvol->freezed_ranges)) {
+			TAILQ_REMOVE(&lvol->pending_freezed_ranges, range, tailq);
+			queued_ctx = SPDK_CONTAINEROF(range, struct quiesce_lvol_ctx, range);
+			TAILQ_INSERT_TAIL(&lvol->freezed_ranges, range, tailq);
+			spdk_thread_send_msg(queued_ctx->range.owner_thread,
+					     _vbdev_lvol_quiesce_ctx_msg, queued_ctx);
+		}
+	}
+	spdk_spin_unlock(&lvol->spinlock);
+
+	ctx->cb_fn(ctx->cb_arg, ctx->range.lvol, status);
+	free(ctx);
+}
+
+static void
+_vbdev_lvol_unquiesce_get_channel(struct spdk_io_channel_iter *i)
+{
+	struct quiesce_lvol_ctx		*ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel		*channel = spdk_io_channel_iter_get_channel(i);
+	struct spdk_lvol_channel	*lvol_channel = spdk_io_channel_get_ctx(channel);
+	TAILQ_HEAD(, vbdev_lvol_io)	queued_io;
+	struct spdk_bdev_io		*bdev_io;
+	struct spdk_io_channel		*bdev_io_channel;
+	struct freeze_range		*range;
+	struct vbdev_lvol_io		*lvol_io;
+
+	TAILQ_FOREACH(range, &lvol_channel->freezed_ranges, tailq) {
+		if (ctx->range.offset == range->offset &&
+		    ctx->range.length == range->length &&
+		    ctx->range.freezed_ctx == range->freezed_ctx) {
+			TAILQ_REMOVE(&lvol_channel->freezed_ranges, range, tailq);
+			free(range);
+			break;
+		}
+	}
+
+	/* Note: we should almost always be able to assert that the range specified
+	 * was found. But there are some very rare corner cases where a new channel
+	 * gets created simultaneously with an unquiesce, where this function
+	 * would execute on that new channel and wouldn't have the range.
+	 * We also use this to clean up range allocations when a later allocation
+	 * fails in the quiesce path.
+	 * So we can't actually assert() here.
+	 */
+
+	/* Swap the queued IO into a temporary list, and then try to submit them again */
+	TAILQ_INIT(&queued_io);
+	TAILQ_SWAP(&lvol_channel->queued_io, &queued_io, vbdev_lvol_io, link);
+	while (!TAILQ_EMPTY(&queued_io)) {
+		lvol_io = TAILQ_FIRST(&queued_io);
+		bdev_io = spdk_bdev_io_from_ctx(lvol_io);
+		TAILQ_REMOVE(&queued_io, lvol_io, link);
+		bdev_io_channel = spdk_bdev_io_get_io_channel(bdev_io);
+		vbdev_lvol_submit_request(bdev_io_channel, bdev_io);
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static int
+_vbdev_lvol_unquiesce(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io,
+		      spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct quiesce_lvol_ctx		*ctx;
+	struct freeze_range		*range;
+	struct spdk_io_channel		*channel = NULL;
+	void				*io_ctx = NULL;
+	uint64_t			offset;
+	uint64_t			length;
+	if (bdev_io != NULL) {
+		offset = bdev_io->u.bdev.offset_blocks;
+		length = bdev_io->u.bdev.num_blocks;
+		channel = spdk_bdev_io_get_io_channel(bdev_io);
+		io_ctx = bdev_io->internal.caller_ctx;
+	} else {
+		offset = 0;
+		length = lvol->bdev->blockcnt;
+	}
+
+	spdk_spin_lock(&lvol->spinlock);
+	/* To start the unquiesce process, we find the range in the lvol's freezed_ranges
+	 * and remove it. This ensures new channels don't inherit the freezed range.
+	 * Then we will send a message to each channel to remove the range from its
+	 * per-channel list.
+	 */
+	TAILQ_FOREACH(range, &lvol->freezed_ranges, tailq) {
+		if (range->offset == offset && range->length == length &&
+		    range->freezed_ctx == io_ctx && range->owner_ch == channel) {
+			break;
+		}
+	}
+	if (range == NULL) {
+		SPDK_ERRLOG("Cannot execute unquiesce on lvol %s, range not found\n", lvol->name);
+		spdk_spin_unlock(&lvol->spinlock);
+		return -EINVAL;
+	}
+	TAILQ_REMOVE(&lvol->freezed_ranges, range, tailq);
+	ctx = SPDK_CONTAINEROF(range, struct quiesce_lvol_ctx, range);
+	spdk_spin_unlock(&lvol->spinlock);
+
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	spdk_for_each_channel(lvol, _vbdev_lvol_unquiesce_get_channel, ctx, _vbdev_lvol_unquiesce_done);
+	return 0;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

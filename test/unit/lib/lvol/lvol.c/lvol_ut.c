@@ -38,6 +38,7 @@ DEFINE_STUB(spdk_blob_is_esnap_clone, bool, (const struct spdk_blob *blob), fals
 DEFINE_STUB(spdk_blob_is_degraded, bool, (const struct spdk_blob *blob), false);
 DEFINE_STUB_V(spdk_bs_grow_live,
 	      (struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB(spdk_blob_remove_xattr, int, (struct spdk_blob *blob, const char *name), 0);
 
 
 const char *uuid = "828d9766-ae50-11e7-bd8d-001e67edf350";
@@ -70,6 +71,7 @@ struct spdk_lvol *g_lvol;
 spdk_blob_id g_blobid = 1;
 struct spdk_io_channel *g_io_channel;
 struct lvol_ut_bs_dev g_esnap_dev;
+bool g_checksum_registered = false;
 
 struct spdk_blob_store {
 	struct spdk_bs_opts	bs_opts;
@@ -101,6 +103,13 @@ spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel
 void
 spdk_bs_blob_decouple_parent(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 			     spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, g_inflate_rc);
+}
+
+void
+spdk_bs_blob_detach_parent(struct spdk_blob_store *bs, spdk_blob_id blobid,
+			   spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	cb_fn(cb_arg, g_inflate_rc);
 }
@@ -234,6 +243,10 @@ spdk_blob_get_xattr_value(struct spdk_blob *blob, const char *name,
 		*value = blob->name;
 		*value_len = strnlen(blob->name, SPDK_LVS_NAME_MAX) + 1;
 		return 0;
+	} else if (!strcmp(name, LVOL_SNAPSHOT_CHECKSUM) && g_checksum_registered == true) {
+		*value = &blob->num_clusters;
+		*value_len = 8;
+		return 0;
 	}
 
 	return -ENOENT;
@@ -263,6 +276,27 @@ spdk_bs_blob_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 	return 0;
 }
 
+int
+spdk_bs_blob_range_shallow_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+				spdk_blob_id blobid, uint64_t *clusters_indexes, uint64_t cluster_count,
+				struct spdk_bs_dev *ext_dev,
+				spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
+				spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+	return 0;
+}
+
+int
+spdk_bs_blob_deep_copy(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+		       spdk_blob_id blobid, struct spdk_bs_dev *ext_dev,
+		       spdk_blob_deep_copy_status status_cb_fn, void *status_cb_arg,
+		       spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+	return 0;
+}
+
 bool
 spdk_blob_is_snapshot(struct spdk_blob *blob)
 {
@@ -282,6 +316,45 @@ spdk_bs_blob_set_external_parent(struct spdk_blob_store *bs, spdk_blob_id blob_i
 				 uint32_t id_len, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	cb_fn(cb_arg, 0);
+}
+
+void
+spdk_bs_snapshot_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+			  spdk_blob_id blob_id, const char *xattr_name,
+			  spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+			  spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_checksum_registered = true;
+	cb_fn(cb_arg, 0);
+}
+
+void
+spdk_bs_snapshot_set_range_checksum(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
+				    spdk_blob_id blob_id, const char *xattr_name,
+				    spdk_snapshot_checksum_stop stop_cb_fn, void *stop_cb_arg,
+				    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_checksum_registered = true;
+	cb_fn(cb_arg, 0);
+}
+
+int
+spdk_bs_snapshot_get_range_checksum(struct spdk_blob *blob, uint64_t *checksums,
+				    uint64_t cluster_start_index, uint64_t cluster_count)
+{
+	if (g_checksum_registered == false) {
+		return -ENOENT;
+	}
+
+	if (checksums == NULL) {
+		return -EINVAL;
+	}
+
+	for (uint64_t i = 0; i < cluster_count; i++) {
+		checksums[i] = blob->num_clusters + cluster_start_index + i;
+	}
+
+	return 0;
 }
 
 int
@@ -1624,6 +1697,106 @@ lvol_snapshot_fail(void)
 }
 
 static void
+lvol_snapshot_xattr(void)
+{
+	struct lvol_ut_bs_dev dev;
+	struct spdk_lvol *lvol, *snap;
+	struct spdk_lvs_opts opts;
+	int rc = 0;
+	char *xattrs[] = {"snapshot_timestamp", "2024-01-16T16:06:46Z", "user_created", "true"};
+	char *xattrs_invalid[] = {"snapshot_timestamp", "2024-01-16T16:06:46Z", "checksum", "10"};
+	char *xattrs_bad[] = {"snapshot_timestamp"};
+	const char *value = NULL;
+	size_t value_len = 0;
+	struct xattrs_ctx xattr_ctx;
+
+	init_dev(&dev);
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", 10, true, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	lvol = g_lvol;
+
+	/* Without xattrs, fallback over spdk_lvol_create_snapshot */
+	spdk_lvol_create_snapshot_with_xattrs(lvol, "snap", NULL, 0, lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
+
+	snap = g_lvol;
+
+	/* Should be able to look up name */
+	xattr_ctx.newlvol = lvol;
+	xattr_ctx.xattrs_external = (char **)&xattrs;
+	lvol_get_xattr_value_ext(&xattr_ctx, "name", (const void **)&value, &value_len);
+	CU_ASSERT(value != NULL && strcmp(value, "lvol") == 0);
+	CU_ASSERT(value_len != 0);
+
+	/* With a bad xattrs list */
+	g_lvol = NULL;
+	spdk_lvol_create_snapshot_with_xattrs(lvol, "snap_x", (const char *const *)&xattrs_bad, 1,
+					      lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EINVAL);
+	CU_ASSERT(g_lvol == NULL);
+
+	/* With an invalid xattrs list */
+	g_lvol = NULL;
+	spdk_lvol_create_snapshot_with_xattrs(lvol, "snap_x", (const char *const *)&xattrs_invalid, 4,
+					      lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EINVAL);
+	CU_ASSERT(g_lvol == NULL);
+
+	/* With a valid xattr list */
+	spdk_lvol_create_snapshot_with_xattrs(lvol, "snap_x", (const char *const *)&xattrs, 4,
+					      lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	CU_ASSERT(g_lvol != NULL);
+	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap_x");
+
+	/* Should be able to look up name, snapshot_timestamp and user_created */
+	lvol_get_xattr_value_ext(&xattr_ctx, "name", (const void **)&value, &value_len);
+	CU_ASSERT(value != NULL && strcmp(value, "lvol") == 0);
+	CU_ASSERT(value_len != 0);
+	lvol_get_xattr_value_ext(&xattr_ctx, "snapshot_timestamp", (const void **)&value, &value_len);
+	CU_ASSERT(value != NULL && strcmp(value, "2024-01-16T16:06:46Z") == 0);
+	CU_ASSERT(value_len != 0);
+	lvol_get_xattr_value_ext(&xattr_ctx, "user_created", (const void **)&value, &value_len);
+	CU_ASSERT(value != NULL && strcmp(value, "true") == 0);
+	CU_ASSERT(value_len != 0);
+
+	/* Lvols has to be closed (or destroyed) before unloading lvol store. */
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvserrno = -1;
+
+	spdk_lvol_close(snap, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvserrno = -1;
+
+	spdk_lvol_close(lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvserrno = -1;
+
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&dev);
+}
+
+static void
 lvol_clone(void)
 {
 	struct lvol_ut_bs_dev dev;
@@ -2306,6 +2479,59 @@ lvol_decouple_parent(void)
 
 	g_inflate_rc = 0;
 	spdk_lvol_decouple_parent(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&dev);
+
+	/* Make sure that all references to the io_channel was closed after
+	 * inflate call
+	 */
+	CU_ASSERT(g_io_channel == NULL);
+}
+
+static void
+lvol_detach_parent(void)
+{
+	struct lvol_ut_bs_dev dev;
+	struct spdk_lvs_opts opts;
+	int rc = 0;
+
+	init_dev(&dev);
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", 10, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	spdk_lvol_detach_parent(NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -ENODEV);
+
+	g_inflate_rc = -1;
+	spdk_lvol_detach_parent(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno != 0);
+
+	g_inflate_rc = 0;
+	spdk_lvol_detach_parent(g_lvol, op_complete, NULL);
 	CU_ASSERT(g_lvserrno == 0);
 
 	spdk_lvol_close(g_lvol, op_complete, NULL);
@@ -3403,6 +3629,126 @@ lvol_shallow_copy(void)
 }
 
 static void
+lvol_range_shallow_copy(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_lvs_opts opts;
+	struct spdk_bs_dev ext_dev;
+	int rc = 0;
+
+	init_dev(&bs_dev);
+
+	ext_dev.blocklen = DEV_BUFFER_BLOCKLEN;
+	ext_dev.blockcnt = BS_CLUSTER_SIZE / DEV_BUFFER_BLOCKLEN;
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", BS_CLUSTER_SIZE, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	/* Successful range shallow copy */
+	g_blob_read_only = true;
+	rc = spdk_lvol_range_shallow_copy(g_lvol, NULL, 0, &ext_dev, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Range shallow copy with null lvol */
+	rc = spdk_lvol_range_shallow_copy(NULL, NULL, 0, &ext_dev, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Range shallow copy with null ext_dev */
+	rc = spdk_lvol_range_shallow_copy(g_lvol, NULL, 0, NULL, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+
+	/* Make sure that all references to the io_channel was closed after
+	 * range shallow copy call
+	 */
+	CU_ASSERT(g_io_channel == NULL);
+}
+
+static void
+lvol_deep_copy(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_lvs_opts opts;
+	struct spdk_bs_dev ext_dev;
+	int rc = 0;
+
+	init_dev(&bs_dev);
+
+	ext_dev.blocklen = DEV_BUFFER_BLOCKLEN;
+	ext_dev.blockcnt = BS_CLUSTER_SIZE / DEV_BUFFER_BLOCKLEN;
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", BS_CLUSTER_SIZE, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	/* Successful deep copy */
+	g_blob_read_only = true;
+	rc = spdk_lvol_deep_copy(g_lvol, &ext_dev, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Deep copy with null lvol */
+	rc = spdk_lvol_deep_copy(NULL, &ext_dev, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Deep copy with null ext_dev */
+	rc = spdk_lvol_shallow_copy(g_lvol, NULL, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+
+	/* Make sure that all references to the io_channel was closed after
+	 * deep copy call
+	 */
+	CU_ASSERT(g_io_channel == NULL);
+}
+
+static void
 lvol_set_parent(void)
 {
 	struct lvol_ut_bs_dev bs1_dev;
@@ -3554,6 +3900,150 @@ lvol_set_external_parent(void)
 	g_lvol_store = NULL;
 }
 
+static void
+lvol_snapshot_checksum(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_lvs_opts opts;
+	int rc = 0;
+	uint64_t checksum;
+
+	init_dev(&bs_dev);
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", 4 * BS_CLUSTER_SIZE, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	/* Get checksum without having previously registered it */
+	rc = spdk_lvol_get_snapshot_checksum(g_lvol, &checksum);
+	CU_ASSERT(rc == -ENOENT);
+
+	/* Register checksum with null lvol */
+	spdk_lvol_register_snapshot_checksum(NULL, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EINVAL);
+
+	/* Successful register checksum */
+	spdk_lvol_register_snapshot_checksum(g_lvol, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Register again the checksum */
+	spdk_lvol_register_snapshot_checksum(g_lvol, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Get checksum with null lvol */
+	rc = spdk_lvol_get_snapshot_checksum(NULL, &checksum);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Get checksum with null checksum */
+	rc = spdk_lvol_get_snapshot_checksum(g_lvol, NULL);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Successful get checksum */
+	rc = spdk_lvol_get_snapshot_checksum(g_lvol, &checksum);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksum == 4);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+}
+
+static void
+lvol_snapshot_range_checksums(void)
+{
+	struct lvol_ut_bs_dev bs_dev;
+	struct spdk_lvs_opts opts;
+	int rc = 0;
+	uint64_t checksum;
+	uint64_t checksums[4];
+
+	init_dev(&bs_dev);
+
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&bs_dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "lvol", 4 * BS_CLUSTER_SIZE, false, LVOL_CLEAR_WITH_DEFAULT,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	/* Get checksums without having previously registered them */
+	g_checksum_registered = false;
+	rc = spdk_lvol_get_snapshot_range_checksums(g_lvol, checksums, 0, 4);
+	CU_ASSERT(rc == -ENOENT);
+
+	/* Register checksums with null lvol */
+	spdk_lvol_register_snapshot_range_checksums(NULL, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == -EINVAL);
+
+	/* Successful register checksums */
+	spdk_lvol_register_snapshot_range_checksums(g_lvol, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Register again the checksums */
+	spdk_lvol_register_snapshot_range_checksums(g_lvol, NULL, NULL, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	/* Get clusters checksums with null lvol */
+	rc = spdk_lvol_get_snapshot_range_checksums(NULL, checksums, 0, 4);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Get clusters checksums with null array */
+	rc = spdk_lvol_get_snapshot_range_checksums(g_lvol, NULL, 0, 4);
+	CU_ASSERT(rc == -EINVAL);
+
+	/* Successful get clusters checksums */
+	rc = spdk_lvol_get_snapshot_range_checksums(g_lvol, checksums, 0, 4);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksums[0] == 4);
+	CU_ASSERT(checksums[1] == 5);
+	CU_ASSERT(checksums[2] == 6);
+	CU_ASSERT(checksums[3] == 7);
+
+	/* Get whole checksum */
+	rc = spdk_lvol_get_snapshot_checksum(g_lvol, &checksum);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(checksum == 4);
+
+	spdk_lvol_close(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(g_lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&bs_dev);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3580,6 +4070,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_open);
 	CU_ADD_TEST(suite, lvol_snapshot);
 	CU_ADD_TEST(suite, lvol_snapshot_fail);
+	CU_ADD_TEST(suite, lvol_snapshot_xattr);
 	CU_ADD_TEST(suite, lvol_clone);
 	CU_ADD_TEST(suite, lvol_clone_fail);
 	CU_ADD_TEST(suite, lvol_iter_clones);
@@ -3590,6 +4081,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvs_rename);
 	CU_ADD_TEST(suite, lvol_inflate);
 	CU_ADD_TEST(suite, lvol_decouple_parent);
+	CU_ADD_TEST(suite, lvol_detach_parent);
 	CU_ADD_TEST(suite, lvol_get_xattr);
 	CU_ADD_TEST(suite, lvol_esnap_reload);
 	CU_ADD_TEST(suite, lvol_esnap_create_bad_args);
@@ -3599,8 +4091,12 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_esnap_hotplug);
 	CU_ADD_TEST(suite, lvol_get_by);
 	CU_ADD_TEST(suite, lvol_shallow_copy);
+	CU_ADD_TEST(suite, lvol_deep_copy);
+	CU_ADD_TEST(suite, lvol_range_shallow_copy);
 	CU_ADD_TEST(suite, lvol_set_parent);
 	CU_ADD_TEST(suite, lvol_set_external_parent);
+	CU_ADD_TEST(suite, lvol_snapshot_checksum);
+	CU_ADD_TEST(suite, lvol_snapshot_range_checksums);
 
 	allocate_threads(1);
 	set_thread(0);
