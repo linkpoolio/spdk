@@ -598,6 +598,7 @@ int
 spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 {
 	struct spdk_nvme_ctrlr *ctrlr;
+	uint64_t disconnect_deadline;
 	int rc;
 
 	if (qpair == NULL) {
@@ -622,9 +623,22 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 	/* For async qpairs, the disconnect may not complete immediately. Poll until the qpair
 	 * reaches the DISCONNECTED state to ensure the poll group can be removed without error.
 	 * This prevents resource leaks when spdk_nvme_poll_group_remove() checks the qpair state.
+	 *
+	 * Bound the wait. Under a mass reconnect storm against a downed TCP target a qpair can
+	 * get stuck in DISCONNECTING (the socket teardown never finalises). An unbounded loop
+	 * here would peg this reactor forever, stalling every other qpair it serves and
+	 * cascading keep-alive timeouts across the node. Cap the spin; on timeout fall through
+	 * to the DISCONNECTED check below, which abandons the qpair rather than hang.
 	 */
+	disconnect_deadline = spdk_get_ticks() + spdk_get_ticks_hz();
 	while (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
 		spdk_nvme_qpair_process_completions(qpair, 0);
+		if (spdk_get_ticks() >= disconnect_deadline) {
+			NVME_CTRLR_ERRLOG(ctrlr,
+					  "qpair %u stuck in DISCONNECTING; abandoning after 1s to avoid reactor hang\n",
+					  qpair->id);
+			break;
+		}
 	}
 
 	if (nvme_qpair_get_state(qpair) != NVME_QPAIR_DISCONNECTED) {

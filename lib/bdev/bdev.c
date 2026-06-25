@@ -89,6 +89,14 @@ RB_HEAD(bdev_name_tree, spdk_bdev_name);
 static int
 bdev_name_cmp(struct spdk_bdev_name *name1, struct spdk_bdev_name *name2)
 {
+	if (spdk_unlikely(name1->name == NULL || name2->name == NULL)) {
+		if (name1->name == name2->name) {
+			return 0;
+		}
+
+		return name1->name == NULL ? -1 : 1;
+	}
+
 	return strcmp(name1->name, name2->name);
 }
 
@@ -5061,19 +5069,43 @@ bdev_name_add(struct spdk_bdev_name *bdev_name, struct spdk_bdev *bdev, const ch
 	return 0;
 }
 
-static void
+static bool
 bdev_name_del_unsafe(struct spdk_bdev_name *bdev_name)
 {
-	RB_REMOVE(bdev_name_tree, &g_bdev_mgr.bdev_names, bdev_name);
+	struct spdk_bdev_name *removed;
+
+	if (bdev_name->name == NULL) {
+		SPDK_ERRLOG("Bdev name entry %p is already deleted\n", bdev_name);
+		return false;
+	}
+
+	removed = RB_REMOVE(bdev_name_tree, &g_bdev_mgr.bdev_names, bdev_name);
+	if (removed != bdev_name) {
+		SPDK_ERRLOG("Bdev name entry %p (%s) is missing from the name tree\n",
+			    bdev_name, bdev_name->name);
+		return false;
+	}
+
 	free(bdev_name->name);
+	bdev_name->name = NULL;
+	bdev_name->bdev = NULL;
+	bdev_name->node.rbe_left = NULL;
+	bdev_name->node.rbe_right = NULL;
+	bdev_name->node.rbe_parent = NULL;
+
+	return true;
 }
 
-static void
+static bool
 bdev_name_del(struct spdk_bdev_name *bdev_name)
 {
+	bool deleted;
+
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	bdev_name_del_unsafe(bdev_name);
+	deleted = bdev_name_del_unsafe(bdev_name);
 	spdk_spin_unlock(&g_bdev_mgr.spinlock);
+
+	return deleted;
 }
 
 int
@@ -5106,13 +5138,16 @@ spdk_bdev_alias_add(struct spdk_bdev *bdev, const char *alias)
 
 static int
 bdev_alias_del(struct spdk_bdev *bdev, const char *alias,
-	       void (*alias_del_fn)(struct spdk_bdev_name *n))
+	       bool (*alias_del_fn)(struct spdk_bdev_name *n))
 {
 	struct spdk_bdev_alias *tmp;
 
 	TAILQ_FOREACH(tmp, &bdev->aliases, tailq) {
 		if (strcmp(alias, tmp->alias.name) == 0) {
 			TAILQ_REMOVE(&bdev->aliases, tmp, tailq);
+			/* The name-tree entry removal may report it was already gone
+			 * (double-delete guard), but the alias wrapper was just unlinked
+			 * from bdev->aliases and must always be freed. */
 			alias_del_fn(&tmp->alias);
 			free(tmp);
 			return 0;
@@ -5136,7 +5171,7 @@ spdk_bdev_alias_del(struct spdk_bdev *bdev, const char *alias)
 }
 
 static void
-bdev_alias_del_all(struct spdk_bdev *bdev, void (*alias_del_fn)(struct spdk_bdev_name *n))
+bdev_alias_del_all(struct spdk_bdev *bdev, bool (*alias_del_fn)(struct spdk_bdev_name *n))
 {
 	struct spdk_bdev_alias *p, *tmp;
 
@@ -7999,6 +8034,26 @@ bdev_io_complete_unsubmitted(struct spdk_bdev_io *bdev_io)
 }
 
 static void bdev_destroy_cb(void *io_device);
+static int bdev_unregister_unsafe(struct spdk_bdev *bdev);
+
+static void
+bdev_unregister_if_ready(struct spdk_bdev *bdev)
+{
+	int rc = -EBUSY;
+
+	spdk_spin_lock(&g_bdev_mgr.spinlock);
+	spdk_spin_lock(&bdev->internal.spinlock);
+	if (bdev->internal.status == SPDK_BDEV_STATUS_REMOVING &&
+	    TAILQ_EMPTY(&bdev->internal.open_descs)) {
+		rc = bdev_unregister_unsafe(bdev);
+	}
+	spdk_spin_unlock(&bdev->internal.spinlock);
+	spdk_spin_unlock(&g_bdev_mgr.spinlock);
+
+	if (rc == 0) {
+		spdk_io_device_unregister(__bdev_to_io_dev(bdev), bdev_destroy_cb);
+	}
+}
 
 static inline void
 _bdev_reset_complete(void *ctx)
@@ -8040,10 +8095,7 @@ bdev_reset_complete(struct spdk_bdev *bdev, void *_ctx, int status)
 
 	_bdev_reset_complete(bdev_io);
 
-	if (bdev->internal.status == SPDK_BDEV_STATUS_REMOVING &&
-	    TAILQ_EMPTY(&bdev->internal.open_descs)) {
-		spdk_io_device_unregister(__bdev_to_io_dev(bdev), bdev_destroy_cb);
-	}
+	bdev_unregister_if_ready(bdev);
 }
 
 static void
@@ -8638,6 +8690,11 @@ bdev_unregister_unsafe(struct spdk_bdev *bdev)
 		rc = -EBUSY;
 	}
 
+	if (bdev->internal.reset_in_progress != NULL) {
+		/* Reset completion will continue unregister once it clears reset_in_progress. */
+		rc = -EBUSY;
+	}
+
 	/* If there are no descriptors, proceed removing the bdev */
 	if (rc == 0) {
 		bdev_examine_allowlist_remove(bdev->name);
@@ -8648,17 +8705,15 @@ bdev_unregister_unsafe(struct spdk_bdev *bdev)
 		TAILQ_REMOVE(&g_bdev_mgr.bdevs, bdev, internal.link);
 		SPDK_DEBUGLOG(bdev, "Removing bdev %s from list done\n", bdev->name);
 
-		/* Delete the name */
+		/* Delete the name after unlinking from the global list. Both happen
+		 * under g_bdev_mgr.spinlock, and the bdev is always still linked here:
+		 * every free path removes the bdev from this list (here) before the
+		 * struct is freed, so the list is never left pointing at freed memory.
+		 */
 		bdev_name_del_unsafe(&bdev->internal.bdev_name);
 
 		spdk_notify_send("bdev_unregister", spdk_bdev_get_name(bdev));
-
-		if (bdev->internal.reset_in_progress != NULL) {
-			/* If reset is in progress, let the completion callback for reset
-			 * unregister the bdev.
-			 */
-			rc = -EBUSY;
-		}
+		bdev->internal.status = SPDK_BDEV_STATUS_INVALID;
 	}
 
 	return rc;
@@ -8719,7 +8774,8 @@ spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void
 	SPDK_DEBUGLOG(bdev, "Removing bdev %s from list\n", bdev->name);
 
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	if (bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
+	if (bdev->internal.status == SPDK_BDEV_STATUS_INVALID ||
+	    bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
 	    bdev->internal.status == SPDK_BDEV_STATUS_REMOVING) {
 		spdk_spin_unlock(&g_bdev_mgr.spinlock);
 		if (cb_fn) {
@@ -8858,7 +8914,8 @@ bdev_open(struct spdk_bdev *bdev, bool write, struct spdk_bdev_desc *desc)
 	desc->write = write;
 
 	spdk_spin_lock(&bdev->internal.spinlock);
-	if (bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
+	if (bdev->internal.status == SPDK_BDEV_STATUS_INVALID ||
+	    bdev->internal.status == SPDK_BDEV_STATUS_UNREGISTERING ||
 	    bdev->internal.status == SPDK_BDEV_STATUS_REMOVING) {
 		spdk_spin_unlock(&bdev->internal.spinlock);
 		return -ENODEV;
@@ -9826,92 +9883,139 @@ spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
 	return desc->bdev;
 }
 
-int
-spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn)
+/*
+ * Open a descriptor (a "pin") on the first bdev at or after *bdev that can be
+ * opened, walking the list with next_fn().  Must be called with
+ * g_bdev_mgr.spinlock held.
+ *
+ * Holding an open descriptor keeps the bdev alive across a subsequent drop of
+ * g_bdev_mgr.spinlock: a concurrent unregister of a pinned bdev observes a
+ * non-empty internal.open_descs in bdev_unregister_unsafe() and defers
+ * (rc == -EBUSY), so the struct is not destructed/freed until we close the
+ * descriptor.  Bdevs that are already unregistering (bdev_open() returns
+ * -ENODEV) are skipped, matching the previous behaviour.
+ *
+ * On success *bdev is updated to the pinned bdev and *desc to its descriptor.
+ * When no openable bdev remains, *bdev is set to NULL and *desc is untouched.
+ * A non-zero return is a hard error (e.g. -ENOMEM) and *bdev is set to NULL.
+ */
+static int
+bdev_pin_next(struct spdk_bdev **bdev, struct spdk_bdev_desc **desc,
+	      struct spdk_bdev *(*next_fn)(struct spdk_bdev *prev), struct spdk_bdev *prev)
 {
-	struct spdk_bdev *bdev, *tmp;
-	struct spdk_bdev_desc *desc;
+	struct spdk_bdev *cur = *bdev;
+	struct spdk_bdev_desc *d;
+	int rc;
+
+	assert(spdk_spin_held(&g_bdev_mgr.spinlock));
+
+	while (cur != NULL) {
+		rc = bdev_desc_alloc(cur, _tmp_bdev_event_cb, NULL, NULL, &d);
+		if (rc != 0) {
+			*bdev = NULL;
+			return rc;
+		}
+		rc = bdev_open(cur, false, d);
+		if (rc == 0) {
+			*bdev = cur;
+			*desc = d;
+			return 0;
+		}
+		bdev_desc_free(d);
+		if (rc != -ENODEV) {
+			/* Hard error - propagate it. */
+			*bdev = NULL;
+			return rc;
+		}
+		/* Bdev is unregistering; skip it and try the next one. */
+		prev = cur;
+		cur = next_fn(prev);
+	}
+
+	*bdev = NULL;
+	return 0;
+}
+
+static int
+bdev_for_each_pinned(void *ctx, spdk_for_each_bdev_fn fn,
+		     struct spdk_bdev *(*first_fn)(void),
+		     struct spdk_bdev *(*next_fn)(struct spdk_bdev *prev))
+{
+	struct spdk_bdev *bdev, *next;
+	struct spdk_bdev_desc *desc, *next_desc;
 	int rc = 0;
 
 	assert(fn != NULL);
 
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	bdev = spdk_bdev_first();
+
+	/* Pin the first bdev we will visit (read the list head under the lock). */
+	bdev = first_fn();
+	rc = bdev_pin_next(&bdev, &desc, next_fn, NULL);
+	if (rc != 0) {
+		spdk_spin_unlock(&g_bdev_mgr.spinlock);
+		return rc;
+	}
+
 	while (bdev != NULL) {
-		rc = bdev_desc_alloc(bdev, _tmp_bdev_event_cb, NULL, NULL, &desc);
-		if (rc != 0) {
-			break;
-		}
-		rc = bdev_open(bdev, false, desc);
-		if (rc != 0) {
-			bdev_desc_free(desc);
-			if (rc == -ENODEV) {
-				/* Ignore the error and move to the next bdev. */
-				rc = 0;
-				bdev = spdk_bdev_next(bdev);
-				continue;
+		/*
+		 * Pin the next bdev *before* dropping the lock.  This keeps the
+		 * not-yet-visited bdev alive across fn() (and across the lock
+		 * drop), so a concurrent teardown cannot destruct and free it
+		 * out from under the iterator.  We compute next using the bdev
+		 * we are about to visit, which is still in the list because we
+		 * hold a descriptor on it.
+		 */
+		next = next_fn(bdev);
+		next_desc = NULL;
+		if (next != NULL) {
+			rc = bdev_pin_next(&next, &next_desc, next_fn, bdev);
+			if (rc != 0) {
+				/* Hard error pinning the next bdev: still close the
+				 * current pin and bail out without a leak. */
+				bdev_close(bdev, desc);
+				break;
 			}
-			break;
 		}
+
 		spdk_spin_unlock(&g_bdev_mgr.spinlock);
 
 		rc = fn(ctx, bdev);
 
 		spdk_spin_lock(&g_bdev_mgr.spinlock);
-		tmp = spdk_bdev_next(bdev);
+
+		/* Done with the current bdev; release its pin (this may let a
+		 * deferred unregister of it now proceed). */
 		bdev_close(bdev, desc);
+
 		if (rc != 0) {
+			/* Caller asked to stop; release the next pin too. */
+			if (next != NULL) {
+				bdev_close(next, next_desc);
+			}
 			break;
 		}
-		bdev = tmp;
+
+		/* Advance: the already-pinned next bdev becomes current. */
+		bdev = next;
+		desc = next_desc;
 	}
+
 	spdk_spin_unlock(&g_bdev_mgr.spinlock);
 
 	return rc;
 }
 
 int
+spdk_for_each_bdev(void *ctx, spdk_for_each_bdev_fn fn)
+{
+	return bdev_for_each_pinned(ctx, fn, spdk_bdev_first, spdk_bdev_next);
+}
+
+int
 spdk_for_each_bdev_leaf(void *ctx, spdk_for_each_bdev_fn fn)
 {
-	struct spdk_bdev *bdev, *tmp;
-	struct spdk_bdev_desc *desc;
-	int rc = 0;
-
-	assert(fn != NULL);
-
-	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	bdev = spdk_bdev_first_leaf();
-	while (bdev != NULL) {
-		rc = bdev_desc_alloc(bdev, _tmp_bdev_event_cb, NULL, NULL, &desc);
-		if (rc != 0) {
-			break;
-		}
-		rc = bdev_open(bdev, false, desc);
-		if (rc != 0) {
-			bdev_desc_free(desc);
-			if (rc == -ENODEV) {
-				/* Ignore the error and move to the next bdev. */
-				rc = 0;
-				bdev = spdk_bdev_next_leaf(bdev);
-				continue;
-			}
-			break;
-		}
-		spdk_spin_unlock(&g_bdev_mgr.spinlock);
-
-		rc = fn(ctx, bdev);
-
-		spdk_spin_lock(&g_bdev_mgr.spinlock);
-		tmp = spdk_bdev_next_leaf(bdev);
-		bdev_close(bdev, desc);
-		if (rc != 0) {
-			break;
-		}
-		bdev = tmp;
-	}
-	spdk_spin_unlock(&g_bdev_mgr.spinlock);
-
-	return rc;
+	return bdev_for_each_pinned(ctx, fn, spdk_bdev_first_leaf, spdk_bdev_next_leaf);
 }
 
 int
@@ -10088,7 +10192,6 @@ static void
 bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 {
 	struct spdk_bdev *bdev;
-	int rc;
 
 	spdk_spin_lock(&ctx->bdev->internal.spinlock);
 	ctx->bdev->internal.qos_mod_in_progress = false;
@@ -10100,21 +10203,7 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 	bdev = ctx->bdev;
 	free(ctx);
 
-	spdk_spin_lock(&g_bdev_mgr.spinlock);
-	spdk_spin_lock(&bdev->internal.spinlock);
-	if (bdev->internal.status == SPDK_BDEV_STATUS_REMOVING && TAILQ_EMPTY(&bdev->internal.open_descs)) {
-		SPDK_DEBUGLOG(bdev, "Data race detected - trying to enable QoS on unregistered bdev %s",
-			      bdev->name);
-		rc = bdev_unregister_unsafe(bdev);
-		spdk_spin_unlock(&bdev->internal.spinlock);
-
-		if (rc == 0) {
-			spdk_io_device_unregister(__bdev_to_io_dev(bdev), bdev_destroy_cb);
-		}
-	} else {
-		spdk_spin_unlock(&bdev->internal.spinlock);
-	}
-	spdk_spin_unlock(&g_bdev_mgr.spinlock);
+	bdev_unregister_if_ready(bdev);
 }
 
 static void

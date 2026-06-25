@@ -491,10 +491,40 @@ static int
 nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
+	struct nvme_tcp_poll_group *group;
 
 	assert(qpair != NULL);
 	nvme_tcp_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	assert(TAILQ_EMPTY(&tqpair->outstanding_reqs));
+
+	/*
+	 * Defensively dequeue from group->needs_poll / group->timeout_enabled
+	 * before free. Cleanup of those two TAILQs is split across multiple
+	 * paths (disconnect_qpair, sock_cb, poll_group_disconnect_qpair_qid,
+	 * poll_group_remove) and the only path that handles BOTH is
+	 * poll_group_remove. Under heavy disconnect/reconnect churn an async
+	 * qpair can reach delete_io_qpair while still enqueued — typically
+	 * when spdk_nvme_ctrlr_free_io_qpair (nvme_ctrlr.c) finds
+	 * qpair->poll_group == NULL at the gate before calling
+	 * spdk_nvme_poll_group_remove and skips the cleanup, but earlier
+	 * disconnect_qpair set sock=NULL without touching link_timeout.
+	 * The next poll_group_process_completions tick then iterates
+	 * needs_poll/timeout_enabled, dereferences the tqpair memory we just
+	 * freed, and reads garbage cntlid/qid out of the kept-around bytes
+	 * (observed: cntlid:8448, qid:61802). spdk_tgt segfaults on the next
+	 * pointer chase. This belt-and-suspenders dequeue closes the window;
+	 * the only side effect on a well-behaved caller is two no-op TAILQ
+	 * checks.
+	 */
+	if (qpair->poll_group != NULL) {
+		group = nvme_tcp_poll_group(qpair->poll_group);
+		if (TAILQ_ENTRY_ENQUEUED(tqpair, link_poll)) {
+			TAILQ_REMOVE_CLEAR(&group->needs_poll, tqpair, link_poll);
+		}
+		if (TAILQ_ENTRY_ENQUEUED(tqpair, link_timeout)) {
+			TAILQ_REMOVE_CLEAR(&group->timeout_enabled, tqpair, link_timeout);
+		}
+	}
 
 	nvme_qpair_deinit(qpair);
 	nvme_tcp_free_reqs(tqpair);

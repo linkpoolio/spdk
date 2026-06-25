@@ -1202,6 +1202,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: Expected PDU header length and received are different. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_IC_REQ;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_INVALID;
 	tqpair.pdu_in_progress->hdr.common.plen = sizeof(struct spdk_nvme_tcp_ic_req);
@@ -1216,6 +1217,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: The TCP/IP tqpair connection is not negotiated. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_IC_RESP;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_INVALID;
 	tqpair.pdu_in_progress->hdr.common.plen = sizeof(struct spdk_nvme_tcp_ic_req);
@@ -1229,6 +1231,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: Unexpected PDU type. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_CAPSULE_RESP;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_RUNNING;
 	tqpair.pdu_in_progress->hdr.common.plen = 0;
@@ -1243,6 +1246,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: PDU type is SPDK_NVME_TCP_PDU_TYPE_IC_REQ, let plen error. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_IC_REQ;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_INVALID;
 	tqpair.pdu_in_progress->hdr.common.plen = 0;
@@ -1258,6 +1262,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: PDU type is SPDK_NVME_TCP_PDU_TYPE_CAPSULE_CMD, let plen error. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_CAPSULE_CMD;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_RUNNING;
 	tqpair.pdu_in_progress->hdr.common.flags = SPDK_NVME_TCP_CH_FLAGS_HDGSTF;
@@ -1274,6 +1279,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: PDU type is SPDK_NVME_TCP_PDU_TYPE_H2C_DATA, let plen error. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_H2C_DATA;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_RUNNING;
 	tqpair.pdu_in_progress->hdr.common.plen = 0;
@@ -1290,6 +1296,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: PDU type is SPDK_NVME_TCP_PDU_TYPE_H2C_TERM_REQ, let plen error. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_H2C_TERM_REQ;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_RUNNING;
 	tqpair.pdu_in_progress->hdr.common.plen = 0;
@@ -1305,6 +1312,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: PDU type is SPDK_NVME_TCP_PDU_TYPE_CAPSULE_CMD, let pdo error. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_CAPSULE_CMD;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_RUNNING;
 	tqpair.cpda = 1;
@@ -1323,6 +1331,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: PDU type is SPDK_NVME_TCP_PDU_TYPE_H2C_DATA, let pdo error. Expect: fail */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_H2C_DATA;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_RUNNING;
 	tqpair.cpda = 1;
@@ -1340,6 +1349,7 @@ test_nvmf_tcp_pdu_ch_handle(void)
 
 	/* Test case: All parameters is conformed to the function. Expect: PASS */
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH;
+	tqpair.pdu_in_progress = &pdu_in_progress;
 	tqpair.pdu_in_progress->hdr.common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_IC_REQ;
 	tqpair.state = NVMF_TCP_QPAIR_STATE_INVALID;
 	tqpair.pdu_in_progress->hdr.common.plen = sizeof(struct spdk_nvme_tcp_ic_req);
@@ -1593,6 +1603,72 @@ test_nvmf_tcp_get_request_resuse_flags(void)
 	SPDK_CU_ASSERT_FATAL(tcp_req->req.cmd_cb_fn == NULL);
 }
 
+static void
+test_nvmf_tcp_qpair_set_recv_state_quiescing(void)
+{
+	struct spdk_nvmf_tcp_qpair tqpair = {};
+	struct nvme_tcp_pdu pdu_in_progress = {};
+	/* Every receive state that owns an in-flight pdu_in_progress, i.e. between PDU pickup
+	 * in AWAIT_PDU_READY and completion in nvmf_tcp_pdu_payload_handle(). A peer reset can
+	 * force any of these into QUIESCING. */
+	enum nvme_tcp_pdu_recv_state inflight_states[] = {
+		NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH,
+		NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_PSH,
+		NVME_TCP_PDU_RECV_STATE_AWAIT_REQ,
+		NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_BUF,
+		NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_PAYLOAD,
+	};
+	size_t i;
+
+	/* For each in-flight state, entering QUIESCING must return the in-flight PDU to the
+	 * free list and drop tcp_pdu_working_count to 0. Previously only AWAIT_PDU_CH was
+	 * drained, so a reset in any other state left working_count stuck > 0, wedging the
+	 * qpair in QUIESCING and hot-looping set_recv_state() from the write-done callbacks. */
+	for (i = 0; i < SPDK_COUNTOF(inflight_states); i++) {
+		SLIST_INIT(&tqpair.tcp_pdu_free_queue);
+		tqpair.recv_state = inflight_states[i];
+		tqpair.pdu_in_progress = &pdu_in_progress;
+		tqpair.tcp_pdu_working_count = 1;
+
+		nvmf_tcp_qpair_set_recv_state(&tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
+
+		CU_ASSERT(tqpair.recv_state == NVME_TCP_PDU_RECV_STATE_QUIESCING);
+		CU_ASSERT(tqpair.tcp_pdu_working_count == 0);
+		CU_ASSERT(tqpair.pdu_in_progress == NULL);
+		CU_ASSERT(SLIST_FIRST(&tqpair.tcp_pdu_free_queue) == &pdu_in_progress);
+
+		/* With the working count drained, QUIESCING -> ERROR is now reachable (the ERROR
+		 * transition asserts tcp_pdu_working_count == 0), i.e. the qpair can converge to
+		 * teardown instead of spinning. */
+		nvmf_tcp_qpair_set_recv_state(&tqpair, NVME_TCP_PDU_RECV_STATE_ERROR);
+		CU_ASSERT(tqpair.recv_state == NVME_TCP_PDU_RECV_STATE_ERROR);
+	}
+
+	/* Re-entering QUIESCING while already QUIESCING (the path the write-done callbacks take
+	 * on a dead socket) must be a no-op and must not underflow the working count. */
+	SLIST_INIT(&tqpair.tcp_pdu_free_queue);
+	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_QUIESCING;
+	tqpair.pdu_in_progress = NULL;
+	tqpair.tcp_pdu_working_count = 0;
+
+	nvmf_tcp_qpair_set_recv_state(&tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
+	CU_ASSERT(tqpair.recv_state == NVME_TCP_PDU_RECV_STATE_QUIESCING);
+	CU_ASSERT(tqpair.tcp_pdu_working_count == 0);
+	CU_ASSERT(SLIST_EMPTY(&tqpair.tcp_pdu_free_queue));
+
+	/* Entering QUIESCING with no in-flight PDU (e.g. from AWAIT_PDU_READY) must leave the
+	 * working count and free list untouched. */
+	SLIST_INIT(&tqpair.tcp_pdu_free_queue);
+	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_READY;
+	tqpair.pdu_in_progress = NULL;
+	tqpair.tcp_pdu_working_count = 0;
+
+	nvmf_tcp_qpair_set_recv_state(&tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
+	CU_ASSERT(tqpair.recv_state == NVME_TCP_PDU_RECV_STATE_QUIESCING);
+	CU_ASSERT(tqpair.tcp_pdu_working_count == 0);
+	CU_ASSERT(SLIST_EMPTY(&tqpair.tcp_pdu_free_queue));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1621,6 +1697,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_retained_psk);
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_tls_psk);
 	CU_ADD_TEST(suite, test_nvmf_tcp_get_request_resuse_flags);
+	CU_ADD_TEST(suite, test_nvmf_tcp_qpair_set_recv_state_quiescing);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

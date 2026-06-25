@@ -152,9 +152,34 @@ struct nvme_ctrlr {
 	/* Poller used to check for reset/detach completion */
 	struct spdk_poller			*reset_detach_poller;
 	struct spdk_nvme_detach_ctx		*detach_ctx;
+	/*
+	 * Tick at which the detach poller started polling
+	 * spdk_nvme_detach_poll_async. If detach doesn't complete within
+	 * NVME_DETACH_TIMEOUT_TICKS, the poller force-completes via
+	 * _nvme_ctrlr_delete instead of polling forever. Without this, a
+	 * qpair stuck in deactivating (peer dropped TCP without finishing
+	 * the disconnect handshake) leaves the controller in state="deleting"
+	 * forever and any consumer trying to close the bdev (raid teardown,
+	 * lvol close, etc.) hangs inside spdk_bdev_close.
+	 */
+	uint64_t				detach_start_tsc;
 
 	uint64_t				reset_start_tsc;
+	/* Tick of the last adminq-poller failover re-drive, used to rate-limit
+	 * re-drives to ~1 Hz against a permanently-failing (downed) target.
+	 * Cleared on a successful reset. See bdev_nvme_poll_adminq. */
+	uint64_t				failover_redrive_tsc;
 	struct spdk_poller			*reconnect_delay_timer;
+	/* One-shot poller that spaces out the reset-complete-retry when the
+	 * underlying spdk_nvme_ctrlr_disconnect() returns -EBUSY. Without it
+	 * the retry fires every reactor tick (sub-millisecond) and — because
+	 * resetting was already cleared by bdev_nvme_reset_ctrlr_complete() —
+	 * the deferred bdev_nvme_reset_ctrlr_complete_failed() is a no-op,
+	 * leaving the controller in limbo until the adminq poller re-drives
+	 * failover at ~1 Hz. Setting this poller gates the adminq re-drive
+	 * via reconnect_is_delayed so retries are spaced reconnect_delay_sec
+	 * apart, matching the normal OP_DELAYED_RECONNECT path. */
+	struct spdk_poller			*ebusy_retry_timer;
 
 	nvme_ctrlr_disconnected_cb		disconnected_cb;
 

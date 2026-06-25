@@ -1800,9 +1800,26 @@ nvmf_tcp_qpair_set_recv_state(struct spdk_nvmf_tcp_qpair *tqpair,
 	}
 
 	if (spdk_unlikely(state == NVME_TCP_PDU_RECV_STATE_QUIESCING)) {
-		if (tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH && tqpair->pdu_in_progress) {
+		/*
+		 * When we are forced into QUIESCING (e.g. the socket was reset) while a PDU is
+		 * still being received, return that PDU to the free list and drop the working
+		 * count so the QUIESCING -> ERROR transition (gated on tcp_pdu_working_count == 0)
+		 * can converge. This previously only handled AWAIT_PDU_CH, so a reset taken in any
+		 * other receive state (PSH/REQ/BUF/PAYLOAD) left tcp_pdu_working_count stuck > 0,
+		 * wedging the qpair in QUIESCING forever; the write-done callbacks then re-entered
+		 * set_recv_state(QUIESCING) every poll, hot-looping the "same recv state" path and
+		 * pegging the reactor. pdu_in_progress is the in-flight PDU handle (NULL only once
+		 * the PDU completes), so draining it here is correct for every receive state.
+		 */
+		if (tqpair->pdu_in_progress &&
+		    (tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_CH ||
+		     tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_PSH ||
+		     tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_REQ ||
+		     tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_BUF ||
+		     tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_PAYLOAD)) {
 			SLIST_INSERT_HEAD(&tqpair->tcp_pdu_free_queue, tqpair->pdu_in_progress, slist);
 			tqpair->tcp_pdu_working_count--;
+			tqpair->pdu_in_progress = NULL;
 		}
 	}
 

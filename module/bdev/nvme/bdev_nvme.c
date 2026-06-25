@@ -475,9 +475,27 @@ nvme_bdev_ctrlr_get_bdev(struct nvme_bdev_ctrlr *nbdev_ctrlr, uint32_t nsid)
 	assert(spdk_thread_is_app_thread(NULL));
 
 	TAILQ_FOREACH(nbdev, &nbdev_ctrlr->bdevs, tailq) {
-		if (nbdev->nsid == nsid) {
-			break;
+		if (nbdev->nsid != nsid) {
+			continue;
 		}
+		/* Skip any instance that is being torn down. Its last namespace has
+		 * already depopulated (ref == 0) and/or spdk_bdev_unregister() is in
+		 * flight (disk status != READY). Such an instance can linger on this
+		 * list with its name storage already freed when its destruct is
+		 * deferred indefinitely (an open descriptor while a reset against a
+		 * downed target never completes). Handing it back to
+		 * nvme_ctrlr_populate_namespace() on reconnect would resurrect a
+		 * half-freed object (use-after-free) and collide on the freed name;
+		 * the caller creates a fresh bdev instead. The dying instance is
+		 * removed from this list by bdev_nvme_destruct() once its destruct
+		 * finally runs.
+		 */
+		if (nbdev->ref == 0 ||
+		    nbdev->disk.internal.status == SPDK_BDEV_STATUS_REMOVING ||
+		    nbdev->disk.internal.status == SPDK_BDEV_STATUS_UNREGISTERING) {
+			continue;
+		}
+		break;
 	}
 
 	return nbdev;
@@ -765,18 +783,49 @@ _nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 	bdev_nvme_fini_done();
 }
 
+/*
+ * Maximum time to wait for spdk_nvme_detach_poll_async to complete before
+ * forcibly tearing down the nvme_ctrlr. Without this, a qpair stuck in
+ * deactivating (peer dropped TCP without finishing the disconnect handshake)
+ * leaves spdk_nvme_detach_poll_async returning -EAGAIN forever, the
+ * controller stays in state="deleting" forever, and any consumer trying to
+ * close the bdev (raid_bdev_destruct -> spdk_bdev_close, lvol close, etc.)
+ * hangs inside spdk_bdev_close. Ten seconds is well past the longest healthy
+ * detach we observe (sub-second under load) and well below any operational
+ * patience for "this controller is unrecoverable, get it out of the way".
+ */
+#define NVME_DETACH_TIMEOUT_SEC 10ULL
+
 static int
 nvme_detach_poller(void *arg)
 {
 	struct nvme_ctrlr *nvme_ctrlr = arg;
+	uint64_t elapsed;
 	int rc;
 
 	rc = spdk_nvme_detach_poll_async(nvme_ctrlr->detach_ctx);
-	if (rc != -EAGAIN) {
-		spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
-		_nvme_ctrlr_delete(nvme_ctrlr);
+	if (rc == -EAGAIN) {
+		elapsed = (spdk_get_ticks() - nvme_ctrlr->detach_start_tsc) / spdk_get_ticks_hz();
+		if (elapsed >= NVME_DETACH_TIMEOUT_SEC) {
+			NVME_CTRLR_ERRLOG(nvme_ctrlr,
+					  "spdk_nvme_detach_poll_async stuck >%" PRIu64 "s "
+					  "(qpair likely deactivating with no peer ack); "
+					  "force-completing controller delete\n",
+					  NVME_DETACH_TIMEOUT_SEC);
+			/* Drop the reference SPDK held for the in-flight detach. The
+			 * underlying NVMe library state will leak (some bytes per
+			 * controller) but the bdev_nvme layer won't deadlock callers
+			 * blocked on close. Acceptable trade-off — better than
+			 * permanently wedged consumers.
+			 */
+			spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
+			_nvme_ctrlr_delete(nvme_ctrlr);
+		}
+		return SPDK_POLLER_BUSY;
 	}
 
+	spdk_poller_unregister(&nvme_ctrlr->reset_detach_poller);
+	_nvme_ctrlr_delete(nvme_ctrlr);
 	return SPDK_POLLER_BUSY;
 }
 
@@ -786,6 +835,7 @@ nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 	int rc;
 
 	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
+	spdk_poller_unregister(&nvme_ctrlr->ebusy_retry_timer);
 
 	if (spdk_interrupt_mode_is_enabled()) {
 		spdk_interrupt_unregister(&nvme_ctrlr->intr);
@@ -796,6 +846,7 @@ nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 
 	/* If we got here, the reset/detach poller cannot be active */
 	assert(nvme_ctrlr->reset_detach_poller == NULL);
+	nvme_ctrlr->detach_start_tsc = spdk_get_ticks();
 	nvme_ctrlr->reset_detach_poller = SPDK_POLLER_REGISTER(nvme_detach_poller,
 					  nvme_ctrlr, 1000);
 	if (nvme_ctrlr->reset_detach_poller == NULL) {
@@ -2021,8 +2072,51 @@ bdev_nvme_poll_adminq(void *arg)
 			bdev_nvme_change_adminq_poll_period(nvme_ctrlr,
 							    g_opts.nvme_adminq_poll_period_us);
 			disconnected_cb(nvme_ctrlr);
-		} else {
-			bdev_nvme_failover_ctrlr(nvme_ctrlr);
+		} else if (!nvme_ctrlr->resetting && !nvme_ctrlr->reconnect_is_delayed) {
+			/*
+			 * Only initiate failover when no reset/failover is already
+			 * in flight. While resetting is true the reset state machine
+			 * owns recovery (reconnect attempts, ctrlr_loss_timeout, and
+			 * advancing to the next trid on reset completion). Without
+			 * this guard, a stuck reconnect (e.g. a remote replica target
+			 * that accepts the TCP connection but never completes the
+			 * admin handshake) makes process_admin_completions return < 0
+			 * on every poll, and each poll re-calls bdev_nvme_failover_ctrlr
+			 * only to hit the "already in progress" path, return -EBUSY,
+			 * and emit a NOTICE. Observed in production as ~231k
+			 * "Unable to perform failover, already in progress." lines in
+			 * ~15 min (~1.1 GB of log), saturating the SPDK reactor until
+			 * the liveness probe SIGKILLed spdk_tgt.
+			 *
+			 * Semantics delta vs the unguarded call: when a plain reset is
+			 * in flight (resetting set, in_failover clear), the unguarded
+			 * call took the -EINPROGRESS branch in
+			 * bdev_nvme_failover_ctrlr_unsafe and set pending_failover, so
+			 * a successful reset failed over immediately on completion.
+			 * With the guard, that failover happens one adminq poll later
+			 * (the admin qpair is still failed, so the next poll re-drives
+			 * it once resetting clears). Failed resets are unaffected:
+			 * bdev_nvme_reset_ctrlr_complete advances the trid itself.
+			 *
+			 * Rate-limit the re-drive. With reconnect_delay_sec == 0 (the
+			 * default) a permanently-failing reset against a downed target
+			 * clears resetting on completion and then this poll re-drives
+			 * failover again immediately, spinning at full reactor speed
+			 * (sub-millisecond, multiplied across every ctrlr on a lost
+			 * storage node). Cap re-drives to ~1 Hz per ctrlr so a dead
+			 * target costs ~1 reset attempt/sec instead of saturating the
+			 * reactor. A successful reset clears failover_redrive_tsc in
+			 * bdev_nvme_reset_ctrlr_complete, so healthy reconnects are
+			 * unaffected; ctrlr_loss_timeout (when configured) still fires.
+			 */
+			uint64_t now = spdk_get_ticks();
+			if (nvme_ctrlr->failover_redrive_tsc != 0 &&
+			    now - nvme_ctrlr->failover_redrive_tsc < spdk_get_ticks_hz()) {
+				/* Too soon since the last re-drive; wait for a later poll. */
+			} else {
+				nvme_ctrlr->failover_redrive_tsc = now;
+				bdev_nvme_failover_ctrlr(nvme_ctrlr);
+			}
 		}
 	} else if (spdk_nvme_ctrlr_get_admin_qp_failure_reason(nvme_ctrlr->ctrlr) !=
 		   SPDK_NVME_QPAIR_FAILURE_NONE) {
@@ -2267,6 +2361,45 @@ bdev_nvme_check_fast_io_fail_timeout(struct nvme_ctrlr *nvme_ctrlr)
 static void bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success);
 
 static void
+bdev_nvme_reset_ctrlr_complete_failed(void *ctx)
+{
+	struct nvme_ctrlr *nvme_ctrlr = ctx;
+
+	/* This is the deferred failure arm of nvme_ctrlr_disconnect(): the reset
+	 * sequence that issued the disconnect is still in flight, so resetting is
+	 * set. Make the deferred completion single-shot/idempotent: if resetting
+	 * has already been cleared (the sequence completed by some other path
+	 * between this send_msg and its delivery, or a duplicate message), do
+	 * nothing. bdev_nvme_reset_ctrlr_complete() must not run twice for one
+	 * reset -- doing so would clear a freshly-started reset's state, double
+	 * flush pending resets, and re-drive failover spuriously.
+	 */
+	if (!nvme_ctrlr->resetting) {
+		return;
+	}
+
+	bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
+}
+
+/* The EBUSY retry timer fires reconnect_delay_sec after the underlying
+ * spdk_nvme_ctrlr_disconnect() returned -EBUSY. By the time it fires, the
+ * qpair teardown has had time to progress (the adminq poller kept running
+ * during the delay). We clear reconnect_is_delayed so the adminq poller
+ * can re-drive failover on its next poll, which will attempt a fresh reset
+ * — not a tight retry loop. ctrlr_loss_timeout accumulates across all
+ * retries (reset_start_tsc is never reset on failure), so the controller
+ * is still destructed after ctrlr_loss_timeout_sec total. */
+static int
+bdev_nvme_ebusy_retry_timer_expired(void *ctx)
+{
+	struct nvme_ctrlr *nvme_ctrlr = ctx;
+
+	spdk_poller_unregister(&nvme_ctrlr->ebusy_retry_timer);
+	nvme_ctrlr->reconnect_is_delayed = false;
+	return SPDK_POLLER_BUSY;
+}
+
+static void
 nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
 {
 	int rc;
@@ -2277,10 +2410,49 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb 
 	if (rc != 0) {
 		NVME_CTRLR_WARNLOG(nvme_ctrlr, "disconnecting ctrlr failed.\n");
 
-		/* Disconnect fails if ctrlr is already resetting or removed. In this case,
-		 * fail the reset sequence immediately.
+		/* Disconnect fails (e.g. -EBUSY) while the underlying ctrlr is still
+		 * tearing down against a downed target. There are two contexts:
+		 *
+		 * 1) During the reset sequence (resetting == true): the reset state
+		 *    machine called nvme_ctrlr_disconnect() to tear down qpairs before
+		 *    reconnecting. We must complete the failed reset via
+		 *    bdev_nvme_reset_ctrlr_complete_failed (deferred via send_msg to
+		 *    break stack recursion — the original acb69478f fix).
+		 *
+		 * 2) During OP_DELAYED_RECONNECT (resetting == false):
+		 *    bdev_nvme_reset_ctrlr_complete already cleared resetting and
+		 *    called nvme_ctrlr_disconnect(cb_fn = start_reconnect_delay_timer).
+		 *    The old send_msg was a no-op here (guard: if (!resetting) return),
+		 *    so the controller sat in limbo until the adminq poller re-drove
+		 *    failover at ~1 Hz — a tight loop wasting reactor cycles for the
+		 *    full ctrlr_loss_timeout window (observed in production: 4 reactors
+		 *    at 100% across every consumer IM during a storage-node restart).
+		 *
+		 *    Instead, gate the retry with reconnect_delay_sec via a one-shot
+		 *    timer. reconnect_is_delayed prevents the adminq poller from
+		 *    re-driving failover during the delay; the adminq poller itself
+		 *    stays running (NOT paused) so it can continue polling the qpair
+		 *    to complete the underlying TCP teardown. After the delay, the
+		 *    timer clears reconnect_is_delayed and the adminq re-drives
+		 *    naturally. ctrlr_loss_timeout still accumulates (reset_start_tsc
+		 *    is never reset on failure), so the controller is destructed after
+		 *    ctrlr_loss_timeout_sec total regardless of EBUSY retry count.
 		 */
-		bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
+		if (!nvme_ctrlr->resetting &&
+		    nvme_ctrlr->opts.reconnect_delay_sec != 0 &&
+		    nvme_ctrlr->ebusy_retry_timer == NULL) {
+			nvme_ctrlr->reconnect_is_delayed = true;
+			nvme_ctrlr->ebusy_retry_timer = SPDK_POLLER_REGISTER(
+				bdev_nvme_ebusy_retry_timer_expired, nvme_ctrlr,
+				nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
+		} else {
+			/* resetting == true (reset sequence needs completion), or
+			 * reconnect_delay_sec == 0 (no delay to apply): fall back to the
+			 * immediate send_msg (the original recursion-break behavior). */
+			spdk_thread_send_msg(spdk_get_thread(),
+					     bdev_nvme_reset_ctrlr_complete_failed,
+					     nvme_ctrlr);
+		}
 		return;
 	}
 
@@ -2364,15 +2536,19 @@ bdev_nvme_reconnect_delay_timer_expired(void *ctx)
 static void
 bdev_nvme_start_reconnect_delay_timer(struct nvme_ctrlr *nvme_ctrlr)
 {
+	/* Cancel any pending EBUSY retry timer — the qpair has finished
+	 * disconnecting (that's why this callback was invoked), so the
+	 * normal reconnect_delay_timer path takes over. */
+	spdk_poller_unregister(&nvme_ctrlr->ebusy_retry_timer);
+
 	spdk_poller_pause(nvme_ctrlr->adminq_timer_poller);
 
-	assert(nvme_ctrlr->reconnect_is_delayed == false);
 	nvme_ctrlr->reconnect_is_delayed = true;
 
 	assert(nvme_ctrlr->reconnect_delay_timer == NULL);
 	nvme_ctrlr->reconnect_delay_timer = SPDK_POLLER_REGISTER(bdev_nvme_reconnect_delay_timer_expired,
-					    nvme_ctrlr,
-					    nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
+				    nvme_ctrlr,
+				    nvme_ctrlr->opts.reconnect_delay_sec * SPDK_SEC_TO_USEC);
 }
 
 static void remove_discovery_entry(struct nvme_ctrlr *nvme_ctrlr);
@@ -2425,6 +2601,8 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 	} else {
 		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Resetting controller successful.\n");
 		nvme_ctrlr->reset_start_tsc = 0;
+		/* Healthy reconnect: clear the adminq-poller re-drive backoff. */
+		nvme_ctrlr->failover_redrive_tsc = 0;
 	}
 
 	nvme_ctrlr->resetting = false;
@@ -3266,14 +3444,21 @@ bdev_nvme_start_ctrlr_failover(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 
 	if (nvme_ctrlr->resetting) {
 		if (!nvme_ctrlr->in_failover) {
-			NVME_CTRLR_NOTICELOG(nvme_ctrlr,
-					     "Reset is already in progress. Defer failover until reset completes.\n");
+			/* Debug level: re-driven once per qpair disconnect event; under a
+			 * mass transport outage this fires at an unbounded rate across
+			 * every controller and a NOTICE here floods the log from the
+			 * reactor thread. The deferral itself is recorded in
+			 * pending_failover; state transitions still log at NOTICE.
+			 */
+			NVME_CTRLR_DEBUGLOG(nvme_ctrlr,
+					    "Reset is already in progress. Defer failover until reset completes.\n");
 
 			/* Defer failover until reset completes. */
 			nvme_ctrlr->pending_failover = true;
 			return -EINPROGRESS;
 		} else {
-			NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Unable to perform failover, already in progress.\n");
+			/* Debug level: see the deferral branch above. */
+			NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Unable to perform failover, already in progress.\n");
 			return -EBUSY;
 		}
 	}
@@ -3281,14 +3466,16 @@ bdev_nvme_start_ctrlr_failover(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	bdev_nvme_failover_trid(nvme_ctrlr, remove, true);
 
 	if (nvme_ctrlr->reconnect_is_delayed) {
-		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Reconnect is already scheduled.\n");
+		/* Debug level: see the deferral branch above. */
+		NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Reconnect is already scheduled.\n");
 
 		/* We rely on the next reconnect for the failover. */
 		return 0;
 	}
 
 	if (nvme_ctrlr->disabled) {
-		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Controller is disabled.\n");
+		/* Debug level: see the deferral branch above. */
+		NVME_CTRLR_DEBUGLOG(nvme_ctrlr, "Controller is disabled.\n");
 
 		/* We rely on the enablement for the failover. */
 		return 0;

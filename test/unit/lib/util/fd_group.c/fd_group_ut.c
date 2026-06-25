@@ -289,6 +289,72 @@ test_fd_group_multi_nest(void)
 	}
 }
 
+static void
+test_fd_group_remove_closed_fd(void)
+{
+	struct spdk_fd_group *fgrp;
+	int fd;
+	int rc;
+	int cb_arg;
+
+	/*
+	 * Regression test for the NVMe-oF/TCP interrupt-mode teardown race: a
+	 * handler's fd can be close()d before spdk_fd_group_remove() is called.
+	 * Closing an fd automatically removes it from the kernel epoll set, so the
+	 * EPOLL_CTL_DEL inside spdk_fd_group_remove() then fails with EBADF.
+	 *
+	 * spdk_fd_group_remove() must NOT abort, and must still complete the handler
+	 * cleanup (decrement num_fds, unlink the handler). Otherwise a stale handler
+	 * is left in the list that the reactor can never remove and busy-spins on.
+	 */
+	rc = spdk_fd_group_create(&fgrp);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	fd = eventfd(0, 0);
+	SPDK_CU_ASSERT_FATAL(fd >= 0);
+
+	rc = SPDK_FD_GROUP_ADD(fgrp, fd, fd_group_cb_fn, &cb_arg);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(fgrp->num_fds == 1);
+
+	/* Close the fd out from under the group; the subsequent EPOLL_CTL_DEL in
+	 * spdk_fd_group_remove() will fail with EBADF. */
+	rc = close(fd);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	/* Must not abort, and must still drop the handler. */
+	spdk_fd_group_remove(fgrp, fd);
+	CU_ASSERT(fgrp->num_fds == 0);
+	CU_ASSERT(TAILQ_EMPTY(&fgrp->event_handlers));
+
+	spdk_fd_group_destroy(fgrp);
+}
+
+static void
+test_fd_group_remove_unregistered_fd(void)
+{
+	struct spdk_fd_group *fgrp;
+	int fd;
+	int rc;
+
+	/* Removing an fd that is not in the group (e.g. a double-remove) must be a
+	 * graceful no-op, not an abort. */
+	rc = spdk_fd_group_create(&fgrp);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	fd = eventfd(0, 0);
+	SPDK_CU_ASSERT_FATAL(fd >= 0);
+
+	/* fd was never added to the group */
+	spdk_fd_group_remove(fgrp, fd);
+	CU_ASSERT(fgrp->num_fds == 0);
+
+	rc = close(fd);
+	CU_ASSERT(rc == 0);
+
+	spdk_fd_group_destroy(fgrp);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -302,6 +368,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_fd_group_basic);
 	CU_ADD_TEST(suite, test_fd_group_nest_unnest);
 	CU_ADD_TEST(suite, test_fd_group_multi_nest);
+	CU_ADD_TEST(suite, test_fd_group_remove_closed_fd);
+	CU_ADD_TEST(suite, test_fd_group_remove_unregistered_fd);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 

@@ -538,6 +538,24 @@ struct spdk_nvme_qpair {
 
 	struct nvme_completion_poll_status	*fabric_poll_status;
 
+	/* Owned by nvme_transport.c: the async-connect poller context for a
+	 * sync TCP qpair (interrupt-mode connect path). Set while the connect
+	 * poller is registered; the poller holds a raw pointer to this qpair,
+	 * so destruction MUST cancel it via nvme_qpair_abort_async_connect()
+	 * (done in nvme_qpair_deinit) or the next poller tick dereferences
+	 * freed memory.
+	 */
+	struct nvme_connect_ctx			*connect_ctx;
+
+	/* The fd registered with the poll group's fd group while this qpair is
+	 * in an interrupt-mode poll group, else -1. Cached at registration so
+	 * removal does not have to re-query the transport: a DISCONNECTING
+	 * qpair's socket may already be closed, in which case the fd cannot be
+	 * fetched any more (observed as a fatal assert during a mass reconnect
+	 * storm).
+	 */
+	int					fgrp_fd;
+
 	/* List entry for spdk_nvme_ctrlr::active_io_qpairs */
 	TAILQ_ENTRY(spdk_nvme_qpair)		tailq;
 
@@ -1435,6 +1453,7 @@ int nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 		    enum spdk_nvme_qprio qprio,
 		    uint32_t num_requests, bool async);
 void	nvme_qpair_deinit(struct spdk_nvme_qpair *qpair);
+void	nvme_qpair_abort_async_connect(struct spdk_nvme_qpair *qpair);
 void	nvme_qpair_complete_error_reqs(struct spdk_nvme_qpair *qpair);
 int	nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 				  struct nvme_request *req);
