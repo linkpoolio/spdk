@@ -2673,6 +2673,20 @@ bdev_nvme_reset_create_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int
 	}
 }
 
+/*
+ * Maximum time to wait for a qpair to become connected after a ctrlr reset
+ * recreated it. An async TCP qpair whose target vanished mid-connect (e.g.
+ * accepted the TCP connection but never sent an ICResp) may generate no
+ * further socket events, so the transport never fails the connect and
+ * bdev_nvme_disconnected_qpair_cb() never fires. Without a bound here the
+ * connect_poller spins forever, the reset sequence stays parked on
+ * ctrlr_ch->reset_iter, resetting never clears, and the ctrlr can neither
+ * finish resetting nor be deleted (ctrlr_loss_timeout_sec is never
+ * evaluated and bdev_nvme_delete_controller returns -ETIMEDOUT forever).
+ * Mirrors NVME_DETACH_TIMEOUT_SEC and the transport level ICReq timeout.
+ */
+#define NVME_QPAIR_CONNECT_TIMEOUT_SEC 10ULL
+
 static int
 bdev_nvme_reset_check_qpair_connected(void *ctx)
 {
@@ -2705,6 +2719,21 @@ bdev_nvme_reset_check_qpair_connected(void *ctx)
 	assert(qpair != NULL);
 
 	if (!spdk_nvme_qpair_is_connected(qpair)) {
+		if (ctrlr_ch->connect_start_tsc != 0 &&
+		    (spdk_get_ticks() - ctrlr_ch->connect_start_tsc) / spdk_get_ticks_hz() >=
+		    NVME_QPAIR_CONNECT_TIMEOUT_SEC) {
+			NVME_QPAIR_ERRLOG(nvme_qpair,
+					  "qpair failed to connect within %" PRIu64 "s in a reset ctrlr sequence. "
+					  "Disconnecting it to abort the reset.\n",
+					  (uint64_t)NVME_QPAIR_CONNECT_TIMEOUT_SEC);
+			/* Clear connect_start_tsc so that the qpair is disconnected only
+			 * once. Keep polling. The disconnect drives the qpair to the
+			 * DISCONNECTED state and bdev_nvme_disconnected_qpair_cb() then
+			 * aborts the reset through the existing path.
+			 */
+			ctrlr_ch->connect_start_tsc = 0;
+			spdk_nvme_ctrlr_disconnect_io_qpair(qpair);
+		}
 		return SPDK_POLLER_BUSY;
 	}
 
@@ -2736,6 +2765,7 @@ bdev_nvme_reset_create_qpair(struct nvme_ctrlr_channel_iter *i,
 		rc = bdev_nvme_create_qpair(nvme_qpair);
 	}
 	if (rc == 0) {
+		ctrlr_ch->connect_start_tsc = spdk_get_ticks();
 		ctrlr_ch->connect_poller = SPDK_POLLER_REGISTER(bdev_nvme_reset_check_qpair_connected,
 					   ctrlr_ch, 0);
 

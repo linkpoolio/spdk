@@ -127,6 +127,11 @@ struct nvme_tcp_qpair {
 
 	uint64_t				icreq_timeout_tsc;
 
+	/* Result of the async socket connect, recorded by nvme_tcp_sock_connect_cb_fn()
+	 * on error so that nvme_tcp_ctrlr_connect_qpair_poll() fails the qpair instead
+	 * of leaving it in NVME_TCP_QPAIR_STATE_SOCK_CONNECTING forever. */
+	int					sock_connect_status;
+
 	bool					shared_stats;
 };
 
@@ -2326,6 +2331,10 @@ nvme_tcp_sock_connect_cb_fn(void *cb_arg, int status)
 
 	if (status < 0) {
 		NVME_TQPAIR_ERRLOG(tqpair, "sock connection error %d (%s)\n", status, spdk_strerror(abs(status)));
+		/* Record the failure so that nvme_tcp_ctrlr_connect_qpair_poll() fails the
+		 * qpair deterministically instead of swallowing the error and leaving the
+		 * qpair in NVME_TCP_QPAIR_STATE_SOCK_CONNECTING forever. */
+		tqpair->sock_connect_status = status;
 		return;
 	}
 
@@ -2415,6 +2424,7 @@ nvme_tcp_qpair_connect_sock(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpai
 		opts.impl_opts_size = sizeof(impl_opts);
 	}
 
+	tqpair->sock_connect_status = 0;
 	nvme_tcp_qpair_set_state(tqpair, NVME_TCP_QPAIR_STATE_SOCK_CONNECTING);
 	tqpair->sock = spdk_sock_connect_async(ctrlr->trid.traddr, port, sock_impl_name, &opts,
 					       nvme_tcp_sock_connect_cb_fn, tqpair);
@@ -2448,6 +2458,13 @@ nvme_tcp_ctrlr_connect_qpair_poll(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvm
 
 	switch (tqpair->state) {
 	case NVME_TCP_QPAIR_STATE_SOCK_CONNECTING:
+		if (spdk_unlikely(tqpair->sock_connect_status != 0)) {
+			NVME_TQPAIR_ERRLOG(tqpair, "Failed to connect the socket (%d): %s\n",
+					   tqpair->sock_connect_status,
+					   spdk_strerror(abs(tqpair->sock_connect_status)));
+			rc = tqpair->sock_connect_status;
+			break;
+		}
 		rc = -EAGAIN;
 		break;
 	case NVME_TCP_QPAIR_STATE_INITIALIZING:
@@ -2960,13 +2977,36 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	struct nvme_tcp_poll_group *group = nvme_tcp_poll_group(tgroup);
 	struct spdk_nvme_qpair *qpair, *tmp_qpair;
 	struct nvme_tcp_qpair *tqpair, *tmp_tqpair;
-	int num_events;
+	int num_events, rc;
 
 	group->completions_per_qpair = completions_per_qpair;
 	group->num_completions = 0;
 	group->stats.polls++;
 
 	num_events = spdk_sock_group_poll(group->sock_group);
+
+	/* A qpair whose socket connect or ICReq exchange is still in progress makes
+	 * progress only when socket events arrive. A target that stops responding
+	 * mid-connect (e.g. accepted the TCP connection but never sent an ICResp)
+	 * generates no further events, so sock_connect_status and icreq_timeout_tsc
+	 * would never be evaluated and the qpair would stay in a connecting state
+	 * forever. Poll such qpairs explicitly and fail them through the regular
+	 * disconnect path. Later connect states have an in-flight request and are
+	 * polled when its response arrives.
+	 */
+	STAILQ_FOREACH_SAFE(qpair, &tgroup->connected_qpairs, poll_group_stailq, tmp_qpair) {
+		tqpair = nvme_tcp_qpair(qpair);
+		if (spdk_unlikely(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING &&
+				  tqpair->state < NVME_TCP_QPAIR_STATE_FABRIC_CONNECT_SEND)) {
+			rc = nvme_tcp_ctrlr_connect_qpair_poll(qpair->ctrlr, qpair);
+			if (rc != 0 && rc != -EAGAIN) {
+				NVME_TQPAIR_ERRLOG(tqpair, "Failed to connect (%d): %s\n",
+						   rc, spdk_strerror(abs(rc)));
+				qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
+				nvme_ctrlr_disconnect_qpair(qpair);
+			}
+		}
+	}
 
 	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
 		tqpair = nvme_tcp_qpair(qpair);

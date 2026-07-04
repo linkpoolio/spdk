@@ -328,6 +328,7 @@ struct spdk_nvme_ctrlr {
 	bool				fail_reset;
 	bool				is_removed;
 	bool				fail_disconnect;
+	bool				hang_qpair_connect;
 	spdk_nvme_aer_cb		aer_cb_fn;
 	struct spdk_nvme_transport_id	trid;
 	TAILQ_HEAD(, spdk_nvme_qpair)	active_io_qpairs;
@@ -811,7 +812,10 @@ spdk_nvme_ctrlr_connect_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		return -EISCONN;
 	}
 
-	qpair->is_connected = true;
+	/* If hang_qpair_connect is set, emulate an async connect that never
+	 * completes. The qpair joins the poll group but never becomes connected.
+	 */
+	qpair->is_connected = !ctrlr->hang_qpair_connect;
 	qpair->failure_reason = SPDK_NVME_QPAIR_FAILURE_NONE;
 
 	if (qpair->poll_group) {
@@ -824,13 +828,13 @@ spdk_nvme_ctrlr_connect_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 void
 spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 {
-	if (!qpair->is_connected) {
-		return;
-	}
-
 	qpair->is_connected = false;
 
-	if (qpair->poll_group != NULL) {
+	/* A qpair whose connect is hanging is in the connected_qpairs list but has
+	 * is_connected == false. Hence check list membership, not is_connected.
+	 */
+	if (qpair->poll_group != NULL &&
+	    qpair->poll_group_tailq_head == &qpair->poll_group->connected_qpairs) {
 		nvme_poll_group_disconnect_qpair(qpair);
 	}
 }
@@ -8792,11 +8796,135 @@ test_start_reconnect_delay_cancels_ebusy_timer(void)
 	CU_ASSERT(nvme_ctrlr->reconnect_delay_timer != NULL);
 	CU_ASSERT(nvme_ctrlr->reconnect_is_delayed == true);
 
-	/* Cleanup. */
+	/* Cleanup. The ctrlr was registered by nvme_ctrlr_create(), so it must be
+	 * deleted through the regular path. Freeing it directly leaves a dangling
+	 * entry in g_nvme_bdev_ctrlrs and a registered io_device, which any later
+	 * test or bdev_nvme_fini() then dereferences.
+	 */
 	spdk_poller_unregister(&nvme_ctrlr->reconnect_delay_timer);
 	nvme_ctrlr->reconnect_is_delayed = false;
 
-	free(nvme_ctrlr);
+	rc = spdk_bdev_nvme_delete("nvme1", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme1") == NULL);
+}
+
+/* Test that a qpair which never completes its connect after a ctrlr reset
+ * does not park the reset sequence forever. This emulates an NVMe-oF TCP
+ * target that vanished mid-reset such that the initiator's async connect
+ * neither completes nor fails (no socket events are generated). The connect
+ * deadline in bdev_nvme_reset_check_qpair_connected() disconnects the qpair,
+ * bdev_nvme_disconnected_qpair_cb() aborts the reset through the existing
+ * path, and the reset completes with failure instead of leaving the ctrlr
+ * resetting (and hence undeletable) forever.
+ */
+static void
+test_reset_ctrlr_qpair_connect_deadline(void)
+{
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_ctrlr *nvme_ctrlr = NULL;
+	struct spdk_nvme_path_id *curr_trid;
+	struct spdk_io_channel *ch1;
+	struct nvme_ctrlr_channel *ctrlr_ch1;
+	int rc, i;
+
+	ut_init_trid(&trid);
+	TAILQ_INIT(&ctrlr.active_io_qpairs);
+
+	set_thread(0);
+
+	rc = nvme_ctrlr_create(&ctrlr, "nvme0", &trid, NULL);
+	CU_ASSERT(rc == 0);
+
+	nvme_ctrlr = nvme_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	curr_trid = TAILQ_FIRST(&nvme_ctrlr->trids);
+	SPDK_CU_ASSERT_FATAL(curr_trid != NULL);
+
+	ch1 = spdk_get_io_channel(nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+
+	ctrlr_ch1 = spdk_io_channel_get_ctx(ch1);
+	CU_ASSERT(ctrlr_ch1->qpair != NULL);
+
+	/* The qpair created after the ctrlr reconnects never completes its connect. */
+	ctrlr.hang_qpair_connect = true;
+
+	rc = bdev_nvme_reset_ctrlr(nvme_ctrlr);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(nvme_ctrlr->resetting == true);
+
+	/* Drive the reset until the qpair is recreated and its connect_poller is
+	 * registered. poll_threads() cannot be used while the connect_poller is
+	 * spinning because the poller is always busy.
+	 */
+	for (i = 0; i < 1000 && ctrlr_ch1->connect_poller == NULL; i++) {
+		spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+		poll_thread_times(0, 2);
+	}
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch1->connect_poller != NULL);
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch1->qpair->qpair != NULL);
+	CU_ASSERT(spdk_nvme_qpair_is_connected(ctrlr_ch1->qpair->qpair) == false);
+	CU_ASSERT(ctrlr_ch1->connect_start_tsc != 0);
+	CU_ASSERT(nvme_ctrlr->resetting == true);
+
+	/* Before the deadline expires the connect poller keeps waiting and the
+	 * reset sequence stays parked on this qpair.
+	 */
+	spdk_delay_us(5 * SPDK_SEC_TO_USEC);
+	poll_thread_times(0, 5);
+
+	CU_ASSERT(ctrlr_ch1->connect_poller != NULL);
+	CU_ASSERT(ctrlr_ch1->qpair->qpair != NULL);
+	CU_ASSERT(ctrlr_ch1->connect_start_tsc != 0);
+	CU_ASSERT(nvme_ctrlr->resetting == true);
+
+	/* Cross the deadline. The connect poller disconnects the qpair,
+	 * bdev_nvme_disconnected_qpair_cb() aborts the reset, and the reset
+	 * completes with failure.
+	 */
+	spdk_delay_us((NVME_QPAIR_CONNECT_TIMEOUT_SEC - 4) * SPDK_SEC_TO_USEC);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr->resetting == false);
+	CU_ASSERT(ctrlr_ch1->connect_poller == NULL);
+	CU_ASSERT(ctrlr_ch1->qpair->qpair == NULL);
+	CU_ASSERT(curr_trid->last_failed_tsc != 0);
+
+	/* After connects work again, the next reset succeeds. */
+	ctrlr.hang_qpair_connect = false;
+
+	rc = bdev_nvme_reset_ctrlr(nvme_ctrlr);
+	CU_ASSERT(rc == 0);
+
+	for (i = 0; i < 1000 && nvme_ctrlr->resetting; i++) {
+		spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+		poll_threads();
+	}
+	CU_ASSERT(nvme_ctrlr->resetting == false);
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch1->qpair->qpair != NULL);
+	CU_ASSERT(spdk_nvme_qpair_is_connected(ctrlr_ch1->qpair->qpair) == true);
+	CU_ASSERT(curr_trid->last_failed_tsc == 0);
+
+	spdk_put_io_channel(ch1);
+
+	poll_threads();
+
+	rc = spdk_bdev_nvme_delete("nvme0", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
 }
 
 int
@@ -8866,6 +8994,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_race_between_ctrlr_loss_timeout_and_pending_failover);
 	CU_ADD_TEST(suite, test_ebusy_retry_respects_reconnect_delay);
 	CU_ADD_TEST(suite, test_start_reconnect_delay_cancels_ebusy_timer);
+	CU_ADD_TEST(suite, test_reset_ctrlr_qpair_connect_deadline);
 
 	allocate_threads(3);
 	set_thread(0);

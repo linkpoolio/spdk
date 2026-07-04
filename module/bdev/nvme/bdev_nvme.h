@@ -212,6 +212,11 @@ struct nvme_ctrlr_channel {
 
 	struct nvme_ctrlr_channel_iter	*reset_iter;
 	struct spdk_poller		*connect_poller;
+	/* Tick at which connect_poller started waiting for the qpair to become
+	 * connected. Cleared to 0 once the connect deadline has fired so the
+	 * qpair is disconnected only once.
+	 */
+	uint64_t			connect_start_tsc;
 };
 
 struct nvme_io_path {

@@ -1631,6 +1631,95 @@ test_nvme_tcp_ctrlr_disconnect_qpair(void)
 	spdk_sock_group_close(&tgroup.sock_group);
 }
 
+/* A socket connect error reported via the async connect callback must be
+ * recorded so that the next connect poll fails the qpair, instead of being
+ * swallowed and leaving the qpair in SOCK_CONNECTING forever.
+ */
+static void
+test_nvme_tcp_qpair_sock_connect_fail(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_tcp_qpair tqpair = {
+		.qpair = {
+			.trtype = SPDK_NVME_TRANSPORT_TCP,
+			.ctrlr = &ctrlr,
+			.state = NVME_QPAIR_CONNECTING,
+		},
+	};
+	int rc;
+
+	tqpair.state = NVME_TCP_QPAIR_STATE_SOCK_CONNECTING;
+
+	nvme_tcp_sock_connect_cb_fn(&tqpair, -ECONNREFUSED);
+
+	CU_ASSERT(tqpair.sock_connect_status == -ECONNREFUSED);
+	CU_ASSERT(tqpair.state == NVME_TCP_QPAIR_STATE_SOCK_CONNECTING);
+
+	rc = nvme_tcp_ctrlr_connect_qpair_poll(&ctrlr, &tqpair.qpair);
+	CU_ASSERT(rc == -ECONNREFUSED);
+}
+
+/* A connecting qpair in a poll group whose target went silent mid-connect
+ * generates no socket events, so its connect deadline must be evaluated by
+ * the poll group sweep and the qpair failed through the regular disconnect
+ * path.
+ */
+static void
+test_nvme_tcp_poll_group_fail_stalled_connect(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_tcp_pdu recv_pdu = {};
+	struct nvme_tcp_qpair tqpair = {
+		.qpair = {
+			.trtype = SPDK_NVME_TRANSPORT_TCP,
+			.ctrlr = &ctrlr,
+			.async = true,
+			.state = NVME_QPAIR_CONNECTING,
+		},
+		.recv_pdu = &recv_pdu,
+	};
+	struct spdk_nvme_qpair *qpair = &tqpair.qpair;
+	struct spdk_nvme_poll_group group = {};
+	struct nvme_tcp_poll_group tgroup = { .group.group = &group };
+	int64_t rc;
+
+	tgroup.sock_group = spdk_sock_group_create(&tgroup);
+	SPDK_CU_ASSERT_FATAL(tgroup.sock_group != NULL);
+
+	qpair->poll_group = &tgroup.group;
+	tqpair.sock = (struct spdk_sock *)0xDEADBEEF;
+	TAILQ_INIT(&tgroup.needs_poll);
+	TAILQ_INIT(&tgroup.timeout_enabled);
+	STAILQ_INIT(&tgroup.group.connected_qpairs);
+	STAILQ_INIT(&tgroup.group.disconnected_qpairs);
+	TAILQ_INIT(&tqpair.send_queue);
+	TAILQ_INIT(&tqpair.free_reqs);
+	TAILQ_INIT(&tqpair.outstanding_reqs);
+	STAILQ_INSERT_TAIL(&tgroup.group.connected_qpairs, qpair, poll_group_stailq);
+
+	/* The ICReq was sent but the ICResp never arrives. While the deadline
+	 * has not expired yet, the sweep polls the qpair but does not fail it. */
+	tqpair.state = NVME_TCP_QPAIR_STATE_INITIALIZING;
+	tqpair.icreq_timeout_tsc = spdk_get_ticks() + spdk_get_ticks_hz();
+
+	rc = nvme_tcp_poll_group_process_completions(&tgroup.group, 0,
+		ut_disconnect_qpair_poll_group_cb);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(qpair->transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_NONE);
+	CU_ASSERT(tqpair.state == NVME_TCP_QPAIR_STATE_INITIALIZING);
+
+	/* Once the deadline expires, the sweep fails the qpair even though no
+	 * socket event has arrived. */
+	spdk_delay_us(2 * SPDK_SEC_TO_USEC);
+
+	rc = nvme_tcp_poll_group_process_completions(&tgroup.group, 0,
+		ut_disconnect_qpair_poll_group_cb);
+	CU_ASSERT(qpair->transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_UNKNOWN);
+
+	STAILQ_REMOVE(&tgroup.group.connected_qpairs, qpair, spdk_nvme_qpair, poll_group_stailq);
+	spdk_sock_group_close(&tgroup.sock_group);
+}
+
 static void
 test_nvme_tcp_ctrlr_create_io_qpair(void)
 {
@@ -1965,6 +2054,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_tcp_capsule_resp_hdr_handle);
 	CU_ADD_TEST(suite, test_nvme_tcp_ctrlr_connect_qpair);
 	CU_ADD_TEST(suite, test_nvme_tcp_ctrlr_disconnect_qpair);
+	CU_ADD_TEST(suite, test_nvme_tcp_qpair_sock_connect_fail);
+	CU_ADD_TEST(suite, test_nvme_tcp_poll_group_fail_stalled_connect);
 	CU_ADD_TEST(suite, test_nvme_tcp_ctrlr_create_io_qpair);
 	CU_ADD_TEST(suite, test_nvme_tcp_ctrlr_delete_io_qpair);
 	CU_ADD_TEST(suite, test_nvme_tcp_poll_group_get_stats);
