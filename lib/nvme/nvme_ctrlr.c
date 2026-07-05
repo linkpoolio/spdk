@@ -627,8 +627,17 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 		spdk_nvme_qpair_process_completions(qpair, 0);
 		if (spdk_get_ticks() >= disconnect_deadline) {
 			NVME_CTRLR_ERRLOG(ctrlr,
-					  "qpair %u stuck in DISCONNECTING; abandoning after 1s to avoid reactor hang\n",
+					  "qpair %u stuck in DISCONNECTING; forcing disconnect completion after 1s to avoid reactor hang\n",
 					  qpair->id);
+			/* A downed TCP peer leaves the qpair DISCONNECTING with a dead
+			 * socket that never finalises (poll-group qpairs flush at the
+			 * group level, not here). Do NOT just break: that returns below
+			 * with the qpair still in the poll group, so the reactor polls
+			 * its dead socket forever (EBADF flush spin) and the controller
+			 * reset never completes. Force the disconnect to complete so the
+			 * qpair reaches DISCONNECTED and is removed from the poll group
+			 * and freed by the code below. */
+			nvme_transport_ctrlr_disconnect_qpair_done(qpair);
 			break;
 		}
 	}
