@@ -2229,9 +2229,16 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
 		if (rc < 0 && errno != EAGAIN) {
 			NVME_TQPAIR_ERRLOG(tqpair, "Failed to flush (%d): %s\n", errno, spdk_strerror(errno));
 			if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
-				if (TAILQ_EMPTY(&tqpair->outstanding_reqs)) {
-					nvme_transport_ctrlr_disconnect_qpair_done(qpair);
+				/* A non-EAGAIN flush error means the socket is dead (e.g. EBADF
+				 * after a peer vanished mid-reset). Its outstanding reqs can
+				 * never complete, so waiting for TAILQ_EMPTY re-flushes the dead
+				 * fd on every poll forever ("Failed to flush: Bad file
+				 * descriptor" spin, reset never completing). Abort the reqs, then
+				 * finalise the disconnect so the qpair stops being polled. */
+				if (!TAILQ_EMPTY(&tqpair->outstanding_reqs)) {
+					nvme_tcp_qpair_abort_reqs(qpair, qpair->abort_dnr);
 				}
+				nvme_transport_ctrlr_disconnect_qpair_done(qpair);
 
 				/* Don't return errors until the qpair gets disconnected */
 				return 0;
