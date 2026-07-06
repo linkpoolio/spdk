@@ -5436,13 +5436,13 @@
         },
         {
           "name": "offset",
-          "type": "number",
+          "type": "uint64",
           "required": false,
           "description": "Offset in bytes of the specific segment of the logical volume (Default: 0)"
         },
         {
           "name": "size",
-          "type": "number",
+          "type": "uint64",
           "required": false,
           "description": "Size in bytes of the specific segment of the logical volume (Default: 0 for representing the entire file)"
         }
@@ -5477,6 +5477,34 @@
       ]
     },
     {
+      "name": "bdev_lvol_start_deep_copy",
+      "params": [
+        {
+          "name": "src_lvol_name",
+          "type": "string",
+          "required": true,
+          "description": "source lvol bdev name"
+        },
+        {
+          "name": "dst_bdev_name",
+          "type": "string",
+          "required": true,
+          "description": "destination bdev name"
+        }
+      ]
+    },
+    {
+      "name": "bdev_lvol_check_deep_copy",
+      "params": [
+        {
+          "name": "operation_id",
+          "type": "uint32",
+          "required": true,
+          "description": "operation identifier"
+        }
+      ]
+    },
+    {
       "name": "bdev_lvol_start_range_shallow_copy",
       "params": [
         {
@@ -5493,8 +5521,7 @@
         },
         {
           "name": "clusters",
-          "type": "array",
-          "required": true,
+          "type": "uint64",
           "description": "Array of indexes of the clusters to be synchronized"
         }
       ]
@@ -5554,13 +5581,13 @@
         },
         {
           "name": "cluster_start_index",
-          "type": "number",
+          "type": "uint64",
           "required": true,
           "description": "start index of the cluster range"
         },
         {
           "name": "cluster_count",
-          "type": "number",
+          "type": "uint64",
           "required": true,
           "description": "number of clusters in the range"
         }

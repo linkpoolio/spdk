@@ -708,7 +708,7 @@ struct rpc_bdev_lvol_set_xattr {
 };
 
 static void
-free_rpc_bdev_lvol_set_xattr(struct rpc_bdev_lvol_set_xattr *req)
+free_rpc_bdev_lvol_set_xattr_req(struct rpc_bdev_lvol_set_xattr *req)
 {
 	free(req->name);
 	free(req->xattr_name);
@@ -774,7 +774,7 @@ rpc_bdev_lvol_set_xattr(struct spdk_jsonrpc_request *request,
 	vbdev_lvol_set_xattr(lvol, req.xattr_name, req.xattr_value, rpc_bdev_lvol_set_xattr_cb, request);
 
 cleanup:
-	free_rpc_bdev_lvol_set_xattr(&req);
+	free_rpc_bdev_lvol_set_xattr_req(&req);
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_set_xattr", rpc_bdev_lvol_set_xattr, SPDK_RPC_RUNTIME)
@@ -785,7 +785,7 @@ struct rpc_bdev_lvol_get_xattr {
 };
 
 static void
-free_rpc_bdev_lvol_get_xattr(struct rpc_bdev_lvol_get_xattr *req)
+free_rpc_bdev_lvol_get_xattr_req(struct rpc_bdev_lvol_get_xattr *req)
 {
 	free(req->name);
 	free(req->xattr_name);
@@ -844,7 +844,7 @@ rpc_bdev_lvol_get_xattr(struct spdk_jsonrpc_request *request,
 	spdk_json_write_string(w, (const char *)xattr_value);
 	spdk_jsonrpc_end_result(request, w);
 cleanup:
-	free_rpc_bdev_lvol_get_xattr(&req);
+	free_rpc_bdev_lvol_get_xattr_req(&req);
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_get_xattr", rpc_bdev_lvol_get_xattr, SPDK_RPC_RUNTIME)
@@ -956,18 +956,22 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_decouple_parent", rpc_bdev_lvol_decouple_parent, SPDK_RPC_RUNTIME)
 
+static const struct spdk_json_object_decoder rpc_bdev_lvol_detach_parent_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_lvol_detach_parent_ctx, name), spdk_json_decode_string},
+};
+
 static void
 rpc_bdev_lvol_detach_parent(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params)
 {
-	struct rpc_bdev_lvol_inflate_ctx req = {};
+	struct rpc_bdev_lvol_detach_parent_ctx req = {};
 	struct spdk_bdev *bdev;
 	struct spdk_lvol *lvol;
 
 	SPDK_INFOLOG(lvol_rpc, "Detaching parent of lvol\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_inflate_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_inflate_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_detach_parent_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_detach_parent_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -992,7 +996,7 @@ rpc_bdev_lvol_detach_parent(struct spdk_jsonrpc_request *request,
 	spdk_lvol_detach_parent(lvol, rpc_bdev_lvol_inflate_cb, request);
 
 cleanup:
-	free_rpc_bdev_lvol_inflate(&req);
+	free_rpc_bdev_lvol_detach_parent(&req);
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_detach_parent", rpc_bdev_lvol_detach_parent, SPDK_RPC_RUNTIME)
@@ -1478,6 +1482,11 @@ struct rpc_bdev_lvol_shallow_copy_ctx {
 static const struct spdk_json_object_decoder rpc_bdev_lvol_start_shallow_copy_decoders[] = {
 	{"src_lvol_name", offsetof(struct rpc_bdev_lvol_shallow_copy, src_lvol_name), spdk_json_decode_string},
 	{"dst_bdev_name", offsetof(struct rpc_bdev_lvol_shallow_copy, dst_bdev_name), spdk_json_decode_string},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_start_range_shallow_copy_decoders[] = {
+	{"src_lvol_name", offsetof(struct rpc_bdev_lvol_shallow_copy, src_lvol_name), spdk_json_decode_string},
+	{"dst_bdev_name", offsetof(struct rpc_bdev_lvol_shallow_copy, dst_bdev_name), spdk_json_decode_string},
 	{"clusters", offsetof(struct rpc_bdev_lvol_shallow_copy, cluster_list), decode_rpc_cluster_list, true},
 };
 
@@ -1603,8 +1612,8 @@ rpc_bdev_lvol_start_range_shallow_copy(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Range shallow copying lvol\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_start_shallow_copy_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_start_shallow_copy_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_start_range_shallow_copy_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_start_range_shallow_copy_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -1776,7 +1785,7 @@ free_rpc_bdev_lvol_deep_copy(struct rpc_bdev_lvol_deep_copy *req)
 	free(req->dst_bdev_name);
 }
 
-static const struct spdk_json_object_decoder rpc_bdev_lvol_deep_copy_decoders[] = {
+static const struct spdk_json_object_decoder rpc_bdev_lvol_start_deep_copy_decoders[] = {
 	{"src_lvol_name", offsetof(struct rpc_bdev_lvol_deep_copy, src_lvol_name), spdk_json_decode_string},
 	{"dst_bdev_name", offsetof(struct rpc_bdev_lvol_deep_copy, dst_bdev_name), spdk_json_decode_string},
 };
@@ -1814,8 +1823,8 @@ rpc_bdev_lvol_start_deep_copy(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Deep copying lvol\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_deep_copy_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_deep_copy_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_start_deep_copy_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_start_deep_copy_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -1896,7 +1905,7 @@ free_rpc_bdev_lvol_deep_copy_status(struct rpc_bdev_lvol_deep_copy_status *req)
 	free(req->src_lvol_name);
 }
 
-static const struct spdk_json_object_decoder rpc_bdev_lvol_deep_copy_status_decoders[] = {
+static const struct spdk_json_object_decoder rpc_bdev_lvol_check_deep_copy_decoders[] = {
 	{"operation_id", offsetof(struct rpc_bdev_lvol_deep_copy_status, operation_id), spdk_json_decode_uint32},
 };
 
@@ -1912,8 +1921,8 @@ rpc_bdev_lvol_check_deep_copy(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Deep copy check\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_deep_copy_status_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_deep_copy_status_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_check_deep_copy_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_check_deep_copy_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -1966,18 +1975,6 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_check_deep_copy", rpc_bdev_lvol_check_deep_copy,
 		  SPDK_RPC_RUNTIME)
-
-struct rpc_bdev_lvol_set_parent {
-	char *lvol_name;
-	char *parent_name;
-};
-
-static void
-free_rpc_bdev_lvol_set_parent(struct rpc_bdev_lvol_set_parent *req)
-{
-	free(req->lvol_name);
-	free(req->parent_name);
-}
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_set_parent_decoders[] = {
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_set_parent_ctx, lvol_name), spdk_json_decode_string},
@@ -2110,13 +2107,13 @@ struct rpc_bdev_lvol_get_fragmap {
 };
 
 static void
-free_rpc_bdev_lvol_get_fragmap(struct rpc_bdev_lvol_get_fragmap *r)
+free_rpc_bdev_lvol_get_fragmap_req(struct rpc_bdev_lvol_get_fragmap *r)
 {
 	free(r->name);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_get_fragmap_decoders[] = {
-	{"name", offsetof(struct rpc_bdev_lvol_get_fragmap, name), spdk_json_decode_string, true},
+	{"name", offsetof(struct rpc_bdev_lvol_get_fragmap, name), spdk_json_decode_string},
 	{"offset", offsetof(struct rpc_bdev_lvol_get_fragmap, offset), spdk_json_decode_uint64, true},
 	{"size", offsetof(struct rpc_bdev_lvol_get_fragmap, size), spdk_json_decode_uint64, true},
 };
@@ -2191,7 +2188,7 @@ rpc_bdev_lvol_get_fragmap(struct spdk_jsonrpc_request *request, const struct spd
 	vbdev_lvol_get_fragmap(lvol, req.offset, req.size, rpc_bdev_lvol_get_fragmap_cb, request);
 
 cleanup:
-	free_rpc_bdev_lvol_get_fragmap(&req);
+	free_rpc_bdev_lvol_get_fragmap_req(&req);
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_get_fragmap", rpc_bdev_lvol_get_fragmap, SPDK_RPC_RUNTIME)
@@ -2213,10 +2210,26 @@ free_rpc_bdev_snapshot_checksum(struct rpc_bdev_snapshot_checksum *req)
 	free(req->name);
 }
 
-static const struct spdk_json_object_decoder rpc_bdev_snapshot_checksum_decoders[] = {
+static const struct spdk_json_object_decoder rpc_bdev_lvol_register_snapshot_checksum_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_snapshot_checksum, name), spdk_json_decode_string},
-	{"cluster_start_index", offsetof(struct rpc_bdev_snapshot_checksum, cluster_start_index), spdk_json_decode_uint64, true},
-	{"cluster_count", offsetof(struct rpc_bdev_snapshot_checksum, cluster_count), spdk_json_decode_uint64, true},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_get_snapshot_checksum_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_snapshot_checksum, name), spdk_json_decode_string},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_register_snapshot_range_checksums_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_snapshot_checksum, name), spdk_json_decode_string},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_get_snapshot_range_checksums_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_snapshot_checksum, name), spdk_json_decode_string},
+	{"cluster_start_index", offsetof(struct rpc_bdev_snapshot_checksum, cluster_start_index), spdk_json_decode_uint64},
+	{"cluster_count", offsetof(struct rpc_bdev_snapshot_checksum, cluster_count), spdk_json_decode_uint64},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_stop_snapshot_checksum_decoders[] = {
+	{"name", offsetof(struct rpc_bdev_snapshot_checksum, name), spdk_json_decode_string},
 };
 
 static bool
@@ -2267,8 +2280,8 @@ rpc_bdev_lvol_register_snapshot_checksum(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Registering snapshot checksum\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
-				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_register_snapshot_checksum_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_register_snapshot_checksum_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -2345,8 +2358,8 @@ rpc_bdev_lvol_get_snapshot_checksum(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Getting snapshot checksum\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
-				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_snapshot_checksum_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_get_snapshot_checksum_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -2400,8 +2413,8 @@ rpc_bdev_lvol_register_snapshot_range_checksums(struct spdk_jsonrpc_request *req
 
 	SPDK_INFOLOG(lvol_rpc, "Registering snapshot range checksums\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
-				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_register_snapshot_range_checksums_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_register_snapshot_range_checksums_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -2483,8 +2496,8 @@ rpc_bdev_lvol_get_snapshot_range_checksums(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Getting snapshot range checksums\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
-				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_snapshot_range_checksums_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_get_snapshot_range_checksums_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -2554,8 +2567,8 @@ rpc_bdev_lvol_stop_snapshot_checksum(struct spdk_jsonrpc_request *request,
 
 	SPDK_INFOLOG(lvol_rpc, "Stopping snapshot checksum registration\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_snapshot_checksum_decoders,
-				    SPDK_COUNTOF(rpc_bdev_snapshot_checksum_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_stop_snapshot_checksum_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_stop_snapshot_checksum_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,

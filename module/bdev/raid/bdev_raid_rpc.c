@@ -450,7 +450,7 @@ struct rpc_bdev_raid_grow_base_bdev {
  * none
  */
 static void
-free_rpc_bdev_raid_grow_base_bdev(struct rpc_bdev_raid_grow_base_bdev *req)
+free_rpc_bdev_raid_grow_base_bdev_req(struct rpc_bdev_raid_grow_base_bdev *req)
 {
 	free(req->raid_bdev_name);
 	free(req->base_bdev_name);
@@ -464,7 +464,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_grow_base_bdev_decode
 	{"base_name", offsetof(struct rpc_bdev_raid_grow_base_bdev, base_bdev_name), spdk_json_decode_string},
 };
 
-struct rpc_bdev_raid_grow_base_bdev_ctx {
+struct rpc_bdev_raid_grow_base_bdev_req_ctx {
 	struct rpc_bdev_raid_grow_base_bdev req;
 	struct spdk_jsonrpc_request *request;
 };
@@ -480,7 +480,7 @@ struct rpc_bdev_raid_grow_base_bdev_ctx {
 static void
 bdev_raid_grow_base_bdev_done(void *cb_arg, int rc)
 {
-	struct rpc_bdev_raid_grow_base_bdev_ctx *ctx = cb_arg;
+	struct rpc_bdev_raid_grow_base_bdev_req_ctx *ctx = cb_arg;
 	struct spdk_jsonrpc_request *request = ctx->request;
 
 	if (rc != 0) {
@@ -493,7 +493,7 @@ bdev_raid_grow_base_bdev_done(void *cb_arg, int rc)
 
 	spdk_jsonrpc_send_bool_response(request, true);
 exit:
-	free_rpc_bdev_raid_grow_base_bdev(&ctx->req);
+	free_rpc_bdev_raid_grow_base_bdev_req(&ctx->req);
 	free(ctx);
 }
 
@@ -511,7 +511,7 @@ static void
 rpc_bdev_raid_grow_base_bdev(struct spdk_jsonrpc_request *request,
 			     const struct spdk_json_val *params)
 {
-	struct rpc_bdev_raid_grow_base_bdev_ctx *ctx;
+	struct rpc_bdev_raid_grow_base_bdev_req_ctx *ctx;
 	struct raid_bdev *raid_bdev;
 	struct spdk_bdev *base_bdev;
 	int rc;
@@ -561,7 +561,7 @@ rpc_bdev_raid_grow_base_bdev(struct spdk_jsonrpc_request *request,
 	return;
 
 cleanup:
-	free_rpc_bdev_raid_grow_base_bdev(&ctx->req);
+	free_rpc_bdev_raid_grow_base_bdev_req(&ctx->req);
 	free(ctx);
 }
 SPDK_RPC_REGISTER("bdev_raid_grow_base_bdev", rpc_bdev_raid_grow_base_bdev, SPDK_RPC_RUNTIME)
@@ -569,7 +569,15 @@ SPDK_RPC_REGISTER("bdev_raid_grow_base_bdev", rpc_bdev_raid_grow_base_bdev, SPDK
 /* delta bitmap */
 
 /* Structure to decode the input parameters for delta bitmap RPC methods. */
-static const struct spdk_json_object_decoder rpc_bdev_raid_base_bdev_delta_bitmap_decoders[] = {
+static const struct spdk_json_object_decoder rpc_bdev_raid_get_base_bdev_delta_bitmap_decoders[] = {
+	{"base_bdev_name", 0, spdk_json_decode_string},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_raid_stop_base_bdev_delta_bitmap_decoders[] = {
+	{"base_bdev_name", 0, spdk_json_decode_string},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_raid_clear_base_bdev_faulty_state_decoders[] = {
 	{"base_bdev_name", 0, spdk_json_decode_string},
 };
 
@@ -589,8 +597,8 @@ rpc_bdev_raid_get_base_bdev_delta_bitmap(struct spdk_jsonrpc_request *request,
 	uint64_t region_size;
 	int rc;
 
-	rc = spdk_json_decode_object(params, rpc_bdev_raid_base_bdev_delta_bitmap_decoders,
-				     SPDK_COUNTOF(rpc_bdev_raid_base_bdev_delta_bitmap_decoders),
+	rc = spdk_json_decode_object(params, rpc_bdev_raid_get_base_bdev_delta_bitmap_decoders,
+				     SPDK_COUNTOF(rpc_bdev_raid_get_base_bdev_delta_bitmap_decoders),
 				     &base_bdev_name);
 	if (rc) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
@@ -673,8 +681,8 @@ rpc_bdev_raid_stop_base_bdev_delta_bitmap(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	if (spdk_json_decode_object(params, rpc_bdev_raid_base_bdev_delta_bitmap_decoders,
-				    SPDK_COUNTOF(rpc_bdev_raid_base_bdev_delta_bitmap_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_raid_stop_base_bdev_delta_bitmap_decoders,
+				    SPDK_COUNTOF(rpc_bdev_raid_stop_base_bdev_delta_bitmap_decoders),
 				    &ctx->base_bdev_name)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
 						 "spdk_json_decode_object failed");
@@ -745,8 +753,8 @@ rpc_bdev_raid_clear_base_bdev_faulty_state(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	if (spdk_json_decode_object(params, rpc_bdev_raid_base_bdev_delta_bitmap_decoders,
-				    SPDK_COUNTOF(rpc_bdev_raid_base_bdev_delta_bitmap_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_raid_clear_base_bdev_faulty_state_decoders,
+				    SPDK_COUNTOF(rpc_bdev_raid_clear_base_bdev_faulty_state_decoders),
 				    &ctx->base_bdev_name)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
 						 "spdk_json_decode_object failed");
