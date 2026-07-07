@@ -469,6 +469,7 @@ bool spdk_lvol_is_degraded(const struct spdk_lvol *lvol);
  * \return 0 if operation starts correctly, negative errno on failure.
  */
 int spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
+			   uint32_t pipeline_depth,
 			   spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			   spdk_lvol_op_complete cb_fn, void *cb_arg);
 
@@ -511,6 +512,7 @@ int spdk_lvol_deep_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
  */
 int spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
 				 uint64_t cluster_count, struct spdk_bs_dev *ext_dev,
+				 uint32_t pipeline_depth,
 				 spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 				 spdk_lvol_op_complete cb_fn, void *cb_arg);
 

@@ -2301,6 +2301,7 @@ _vbdev_lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 
 int
 vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			uint32_t pipeline_depth,
 			spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2347,8 +2348,8 @@ vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 	req->lvol = lvol;
 	req->ext_dev = ext_dev;
 
-	rc = spdk_lvol_shallow_copy(lvol, ext_dev, status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb,
-				    req);
+	rc = spdk_lvol_shallow_copy(lvol, ext_dev, pipeline_depth,
+				    status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb, req);
 
 	if (rc < 0) {
 		ext_dev->destroy(ext_dev);
@@ -2361,6 +2362,7 @@ vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 int
 vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 			      uint64_t *clusters_indexes, uint64_t cluster_count,
+			      uint32_t pipeline_depth,
 			      spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			      spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2408,8 +2410,8 @@ vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 	req->ext_dev = ext_dev;
 
 	rc = spdk_lvol_range_shallow_copy(lvol, clusters_indexes, cluster_count, ext_dev,
-					  status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb,
-					  req);
+					  pipeline_depth,
+					  status_cb_fn, status_cb_arg, _vbdev_lvol_shallow_copy_cb, req);
 
 	if (rc < 0) {
 		ext_dev->destroy(ext_dev);

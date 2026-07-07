@@ -154,6 +154,7 @@ int vbdev_lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *
  * \return 0 if operation starts correctly, negative errno on failure.
  */
 int vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+			    uint32_t pipeline_depth,
 			    spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			    spdk_lvol_op_complete cb_fn, void *cb_arg);
 
@@ -189,6 +190,7 @@ int vbdev_lvol_deep_copy(struct spdk_lvol *lvol, const char *bdev_name,
  */
 int vbdev_lvol_range_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
 				  uint64_t *clusters_indexes, uint64_t cluster_count,
+				  uint32_t pipeline_depth,
 				  spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 				  spdk_lvol_op_complete cb_fn, void *cb_arg);
 
