@@ -3978,6 +3978,24 @@ nvme_rdma_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 {
 	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(ctrlr->adminq);
 
+	/* The admin qpair's rdma_qp is freed and zeroed during an RDMA
+	 * disconnect (nvme_rdma_qpair_disconnected -> rdma_qp_destroy) before
+	 * the controller itself is fully destroyed. Any caller that asks for
+	 * memory domains in that window — e.g. a bdev_nvme consumer probing
+	 * domain capabilities during teardown, or the ctrlr-loss reconnect
+	 * machinery iterating qpairs — would otherwise hit a NULL deref
+	 * (rqpair->rdma_qp == NULL, then ->domain at +0x10 reads NULL+0x10).
+	 * Observed in production as a deterministic spdk_tgt segfault during
+	 * volume disconnect on the storage workers, with the reactor 0
+	 * crashing repeatedly mid-cleanup and the IM bouncing.
+	 *
+	 * Treat this transient state as "no memory domains available" so the
+	 * caller falls back to a non-zero-copy path; once the ctrlr reconnects
+	 * (or finishes destruction) future calls return the real domain. */
+	if (rqpair == NULL || rqpair->rdma_qp == NULL) {
+		return 0;
+	}
+
 	if (domains && array_size > 0) {
 		domains[0] = rqpair->rdma_qp->domain;
 	}
