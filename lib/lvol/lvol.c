@@ -2629,6 +2629,7 @@ lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 
 int
 spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
+		       uint32_t pipeline_depth,
 		       spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 		       spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2669,6 +2670,7 @@ spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 	blob_id = spdk_blob_get_id(lvol->blob);
 
 	rc = spdk_bs_blob_shallow_copy(lvol->lvol_store->blobstore, req->channel, blob_id, ext_dev,
+				       pipeline_depth,
 				       status_cb_fn, status_cb_arg, lvol_shallow_copy_cb, req);
 
 	if (rc < 0) {
@@ -2683,6 +2685,7 @@ spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 int
 spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
 			     uint64_t cluster_count, struct spdk_bs_dev *ext_dev,
+			     uint32_t pipeline_depth,
 			     spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			     spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2725,6 +2728,7 @@ spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
 
 	rc = spdk_bs_blob_range_shallow_copy(lvol->lvol_store->blobstore, req->channel, blob_id,
 					     clusters_indexes, cluster_count, ext_dev,
+					     pipeline_depth,
 					     status_cb_fn, status_cb_arg, lvol_shallow_copy_cb, req);
 
 	if (rc < 0) {

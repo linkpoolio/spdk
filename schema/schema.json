@@ -5462,6 +5462,12 @@
           "type": "string",
           "required": true,
           "description": "Name of the bdev that acts as destination for the copy"
+        },
+        {
+          "name": "pipeline_depth",
+          "type": "uint32",
+          "required": false,
+          "description": "Maximum number of clusters in flight (0 = default 1)"
         }
       ]
     },
@@ -5523,6 +5529,12 @@
           "name": "clusters",
           "type": "uint64",
           "description": "Array of indexes of the clusters to be synchronized"
+        },
+        {
+          "name": "pipeline_depth",
+          "type": "uint32",
+          "required": false,
+          "description": "Maximum number of clusters in flight (0 = default 1)"
         }
       ]
     },

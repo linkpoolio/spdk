@@ -924,6 +924,7 @@ spdk_lvs_notify_hotplug(const void *esnap_id, uint32_t id_len,
 
 int
 spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
+		       uint32_t pipeline_depth,
 		       spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 		       spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -942,6 +943,7 @@ spdk_lvol_shallow_copy(struct spdk_lvol *lvol, struct spdk_bs_dev *ext_dev,
 int
 spdk_lvol_range_shallow_copy(struct spdk_lvol *lvol, uint64_t *clusters_indexes,
 			     uint64_t cluster_count, struct spdk_bs_dev *ext_dev,
+			     uint32_t pipeline_depth,
 			     spdk_blob_shallow_copy_status status_cb_fn, void *status_cb_arg,
 			     spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2289,17 +2291,17 @@ ut_lvol_shallow_copy(void)
 	CU_ASSERT(g_lvolerrno == 0);
 
 	/* Shallow copy error with NULL lvol */
-	rc = vbdev_lvol_shallow_copy(NULL, "", NULL, NULL, vbdev_lvol_shallow_copy_complete, NULL);
+	rc = vbdev_lvol_shallow_copy(NULL, "", 0, NULL, NULL, vbdev_lvol_shallow_copy_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Shallow copy error with NULL bdev name */
-	rc = vbdev_lvol_shallow_copy(g_lvol, NULL, NULL, NULL, vbdev_lvol_shallow_copy_complete, NULL);
+	rc = vbdev_lvol_shallow_copy(g_lvol, NULL, 0, NULL, NULL, vbdev_lvol_shallow_copy_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Successful shallow copy */
 	g_lvolerrno = -1;
 	lvol_already_opened = false;
-	rc = vbdev_lvol_shallow_copy(g_lvol, DEFAULT_BDEV_NAME, NULL, NULL,
+	rc = vbdev_lvol_shallow_copy(g_lvol, DEFAULT_BDEV_NAME, 0, NULL, NULL,
 				     vbdev_lvol_shallow_copy_complete, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -2342,19 +2344,19 @@ ut_lvol_range_shallow_copy(void)
 	CU_ASSERT(g_lvolerrno == 0);
 
 	/* Range shallow copy error with NULL lvol */
-	rc = vbdev_lvol_range_shallow_copy(NULL, "", NULL, 0, NULL, NULL, vbdev_lvol_shallow_copy_complete,
+	rc = vbdev_lvol_range_shallow_copy(NULL, "", NULL, 0, 0, NULL, NULL, vbdev_lvol_shallow_copy_complete,
 					   NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Range shallow copy error with NULL bdev name */
-	rc = vbdev_lvol_range_shallow_copy(g_lvol, NULL, NULL, 0, NULL, NULL,
+	rc = vbdev_lvol_range_shallow_copy(g_lvol, NULL, NULL, 0, 0, NULL, NULL,
 					   vbdev_lvol_shallow_copy_complete, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
 	/* Successful range shallow copy */
 	g_lvolerrno = -1;
 	lvol_already_opened = false;
-	rc = vbdev_lvol_range_shallow_copy(g_lvol, DEFAULT_BDEV_NAME, NULL, 0, NULL, NULL,
+	rc = vbdev_lvol_range_shallow_copy(g_lvol, DEFAULT_BDEV_NAME, NULL, 0, 0, NULL, NULL,
 					   vbdev_lvol_shallow_copy_complete, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);

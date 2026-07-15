@@ -198,13 +198,15 @@ def add_parser(subparsers):
     def bdev_lvol_start_shallow_copy(args):
         print_json(args.client.bdev_lvol_start_shallow_copy(
                                                          src_lvol_name=args.src_lvol_name,
-                                                         dst_bdev_name=args.dst_bdev_name))
+                                                         dst_bdev_name=args.dst_bdev_name,
+                                                         pipeline_depth=args.pipeline_depth))
 
     p = subparsers.add_parser('bdev_lvol_start_shallow_copy',
                               help="""Start a shallow copy of an lvol over a given bdev.  The status of the operation
     can be obtained with bdev_lvol_check_shallow_copy""")
     p.add_argument('src_lvol_name', help='source lvol name')
     p.add_argument('dst_bdev_name', help='destination bdev name')
+    p.add_argument('--pipeline-depth', help='maximum number of clusters in flight (0 = default 1)', type=int)
     p.set_defaults(func=bdev_lvol_start_shallow_copy)
 
     def bdev_lvol_check_shallow_copy(args):
@@ -238,7 +240,8 @@ def add_parser(subparsers):
         print_json(args.client.bdev_lvol_start_range_shallow_copy(
                                                                 src_lvol_name=args.src_lvol_name,
                                                                 dst_bdev_name=args.dst_bdev_name,
-                                                                clusters=args.clusters))
+                                                                clusters=args.clusters,
+                                                                pipeline_depth=args.pipeline_depth))
 
     p = subparsers.add_parser('bdev_lvol_start_range_shallow_copy',
                               help="""Start a range shallow copy of an lvol over a given bdev.  The
@@ -246,6 +249,7 @@ def add_parser(subparsers):
     p.add_argument('src_lvol_name', help='source lvol name')
     p.add_argument('dst_bdev_name', help='destination bdev name')
     p.add_argument('--clusters', help="""List of clusters indexes. Example: 2 3 4 etc""", type=int, nargs='+')
+    p.add_argument('--pipeline-depth', help='maximum number of clusters in flight (0 = default 1)', type=int)
     p.set_defaults(func=bdev_lvol_start_range_shallow_copy)
 
     def bdev_lvol_register_snapshot_range_checksums(args):
