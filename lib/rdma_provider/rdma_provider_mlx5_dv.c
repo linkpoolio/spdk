@@ -26,28 +26,34 @@ struct spdk_rdma_mlx5_dv_qp {
 /*
  * rdma_set_option(RDMA_OPTION_ID_TOS) programs SL (SQ / tx_prio). mlx5_dv
  * moves the QP itself via ibv_modify_qp, so ConnectX builds the RoCEv2
- * IPv4 header from the RTR AV traffic_class — which rdma_init_qp_attr
- * often leaves 0. Fill TOS = SL<<5 (CS DSCP) when the AV is present and
- * traffic_class is unset.
+ * IPv4 header from the RTR AV traffic_class. Inferring TOS from ah_attr.sl
+ * is a no-op: the RTR AV often has sl=0 even when the SQ is prio 3.
+ *
+ * Force IEEE 802.1p class 3 → TOS 96 / DSCP 24 (CS3), matching Longhorn
+ * dataEngineRdmaPriorityClass v2=3. Do not add IBV_QP_AV if the kernel
+ * did not already supply a full AV.
  */
+#define RDMA_MLX5_DV_ROCE_TOS	96
+#define RDMA_MLX5_DV_ROCE_SL	3
+
 static void
 rdma_mlx5_dv_fill_roce_tos(struct ibv_qp_attr *qp_attr, int qp_attr_mask)
 {
-	uint8_t sl;
-
 	if ((qp_attr_mask & IBV_QP_AV) == 0) {
-		return;
-	}
-	if (qp_attr->ah_attr.grh.traffic_class != 0) {
-		return;
-	}
-
-	sl = qp_attr->ah_attr.sl;
-	if (sl == 0) {
+		SPDK_NOTICELOG("RoCE RTR missing IBV_QP_AV, cannot set TOS (mask=0x%x)\n",
+			       qp_attr_mask);
 		return;
 	}
 
-	qp_attr->ah_attr.grh.traffic_class = sl << 5;
+	qp_attr->ah_attr.sl = RDMA_MLX5_DV_ROCE_SL;
+	qp_attr->ah_attr.grh.traffic_class = RDMA_MLX5_DV_ROCE_TOS;
+
+	SPDK_NOTICELOG("RoCE RTR TOS %u sl %u tclass %u is_global %d mask=0x%x\n",
+		       RDMA_MLX5_DV_ROCE_TOS,
+		       qp_attr->ah_attr.sl,
+		       qp_attr->ah_attr.grh.traffic_class,
+		       qp_attr->ah_attr.is_global,
+		       qp_attr_mask);
 }
 
 static int
