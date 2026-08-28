@@ -501,6 +501,8 @@ struct rdma_transport_opts {
 	bool		no_srq;
 	bool		no_wr_batching;
 	int		acceptor_backlog;
+	/* IPv4 TOS / IPv6 TCLASS. 0 keeps the rdma-core default (untagged). */
+	uint8_t		tos;
 };
 
 struct spdk_nvmf_rdma_transport {
@@ -559,7 +561,13 @@ static const struct spdk_json_object_decoder rdma_transport_opts_decoder[] = {
 		"acceptor_backlog", offsetof(struct rdma_transport_opts, acceptor_backlog),
 		spdk_json_decode_int32, true
 	},
+	{
+		"tos", offsetof(struct rdma_transport_opts, tos),
+		spdk_json_decode_uint8, true
+	},
 };
+
+static int nvmf_rdma_apply_tos(struct rdma_cm_id *id, uint8_t tos);
 
 static int
 nvmf_rdma_qpair_compare(struct spdk_nvmf_rdma_qpair *rqpair1, struct spdk_nvmf_rdma_qpair *rqpair2)
@@ -1434,6 +1442,8 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 	rqpair->cm_id = event->id;
 	rqpair->listen_id = event->listen_id;
 	rqpair->qpair.transport = transport;
+	/* Passive side: TOS must be set on the accepted ID before rdma_accept(). */
+	nvmf_rdma_apply_tos(rqpair->cm_id, rtransport->rdma_opts.tos);
 	/* use qid from the private data to determine the qpair type
 	   qid will be set to the appropriate value when the controller is created */
 	rqpair->qpair.qid = private_data->qid;
@@ -2813,7 +2823,7 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 		     "  max_io_qpairs_per_ctrlr=%d,\n"
 		     "  in_capsule_data_size=%d, max_aq_depth=%d,\n"
 		     "  num_cqe=%d, max_srq_depth=%d, no_srq=%d,"
-		     "  acceptor_backlog=%d, no_wr_batching=%d abort_timeout_sec=%d\n",
+		     "  acceptor_backlog=%d, no_wr_batching=%d abort_timeout_sec=%d tos=%u\n",
 		     opts->max_queue_depth,
 		     opts->max_io_size,
 		     opts->max_qpairs_per_ctrlr - 1,
@@ -2824,7 +2834,8 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 		     rtransport->rdma_opts.no_srq,
 		     rtransport->rdma_opts.acceptor_backlog,
 		     rtransport->rdma_opts.no_wr_batching,
-		     opts->abort_timeout_sec);
+		     opts->abort_timeout_sec,
+		     rtransport->rdma_opts.tos);
 
 	if (rtransport->rdma_opts.acceptor_backlog <= 0) {
 		SPDK_ERRLOG("The acceptor backlog cannot be less than 1, setting to the default value of (%d).\n",
@@ -2963,6 +2974,7 @@ nvmf_rdma_dump_opts(struct spdk_nvmf_transport *transport, struct spdk_json_writ
 	}
 	spdk_json_write_named_int32(w, "acceptor_backlog", rtransport->rdma_opts.acceptor_backlog);
 	spdk_json_write_named_bool(w, "no_wr_batching", rtransport->rdma_opts.no_wr_batching);
+	spdk_json_write_named_uint32(w, "tos", rtransport->rdma_opts.tos);
 }
 
 static void
@@ -3018,6 +3030,27 @@ static void nvmf_rdma_trid_from_cm_id(struct rdma_cm_id *id,
 				      bool peer);
 
 static bool nvmf_rdma_rescan_devices(struct spdk_nvmf_rdma_transport *rtransport);
+
+static int
+nvmf_rdma_apply_tos(struct rdma_cm_id *id, uint8_t tos)
+{
+	int rc;
+
+	if (id == NULL || tos == 0) {
+		return 0;
+	}
+
+#ifdef SPDK_CONFIG_RDMA_SET_TOS
+	rc = rdma_set_option(id, RDMA_OPTION_ID, RDMA_OPTION_ID_TOS, &tos, sizeof(tos));
+	if (rc) {
+		SPDK_NOTICELOG("Can't apply RDMA_OPTION_ID_TOS %u, ret %d\n", tos, rc);
+	}
+	return rc;
+#else
+	SPDK_DEBUGLOG(rdma, "transport tos is not supported\n");
+	return 0;
+#endif
+}
 
 static int
 nvmf_rdma_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_transport_id *trid,
@@ -3119,6 +3152,9 @@ nvmf_rdma_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_t
 		free(port);
 		return -1;
 	}
+
+	/* Must be set before rdma_listen() so accepted QPs inherit the TOS. */
+	nvmf_rdma_apply_tos(port->id, rtransport->rdma_opts.tos);
 
 	rc = rdma_listen(port->id, rtransport->rdma_opts.acceptor_backlog);
 	if (rc < 0) {
