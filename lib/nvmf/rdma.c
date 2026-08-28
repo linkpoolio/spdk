@@ -1042,6 +1042,7 @@ nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 
 	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
 	device = rqpair->device;
+	rtransport = SPDK_CONTAINEROF(qpair->transport, struct spdk_nvmf_rdma_transport, transport);
 
 	qp_init_attr.qp_context	= rqpair;
 	qp_init_attr.pd		= device->pd;
@@ -1059,6 +1060,7 @@ nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 	qp_init_attr.cap.max_send_sge	= spdk_min((uint32_t)device->attr.max_sge, NVMF_DEFAULT_TX_SGE);
 	qp_init_attr.cap.max_recv_sge	= spdk_min((uint32_t)device->attr.max_sge, NVMF_DEFAULT_RX_SGE);
 	qp_init_attr.stats		= &rqpair->poller->stat.qp_stats;
+	qp_init_attr.tos		= rtransport->rdma_opts.tos;
 
 	if (rqpair->srq == NULL && nvmf_rdma_resize_cq(rqpair, device) < 0) {
 		SPDK_ERRLOG("Failed to resize the completion queue. Cannot initialize qpair.\n");

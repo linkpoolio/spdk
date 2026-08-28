@@ -819,6 +819,7 @@ nvme_rdma_qpair_init(struct nvme_rdma_qpair *rqpair)
 	attr.cap.max_recv_sge	= spdk_min(NVME_RDMA_DEFAULT_RX_SGE, dev_attr.max_sge);
 	attr.domain_transfer	= spdk_rdma_provider_accel_sequence_supported() ?
 				  nvme_rdma_memory_domain_transfer_data : NULL;
+	attr.tos		= rqpair->qpair.ctrlr->opts.transport_tos;
 
 	rqpair->rdma_qp = spdk_rdma_provider_qp_create(rqpair->cm_id, &attr);
 
