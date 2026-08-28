@@ -23,6 +23,33 @@ struct spdk_rdma_mlx5_dv_qp {
 	struct ibv_qp_ex *qpex;
 };
 
+/*
+ * rdma_set_option(RDMA_OPTION_ID_TOS) programs SL (SQ / tx_prio). mlx5_dv
+ * moves the QP itself via ibv_modify_qp, so ConnectX builds the RoCEv2
+ * IPv4 header from the RTR AV traffic_class — which rdma_init_qp_attr
+ * often leaves 0. Fill TOS = SL<<5 (CS DSCP) when the AV is present and
+ * traffic_class is unset.
+ */
+static void
+rdma_mlx5_dv_fill_roce_tos(struct ibv_qp_attr *qp_attr, int qp_attr_mask)
+{
+	uint8_t sl;
+
+	if ((qp_attr_mask & IBV_QP_AV) == 0) {
+		return;
+	}
+	if (qp_attr->ah_attr.grh.traffic_class != 0) {
+		return;
+	}
+
+	sl = qp_attr->ah_attr.sl;
+	if (sl == 0) {
+		return;
+	}
+
+	qp_attr->ah_attr.grh.traffic_class = sl << 5;
+}
+
 static int
 rdma_mlx5_dv_init_qpair(struct spdk_rdma_mlx5_dv_qp *mlx5_qp)
 {
@@ -48,6 +75,8 @@ rdma_mlx5_dv_init_qpair(struct spdk_rdma_mlx5_dv_qp *mlx5_qp)
 		SPDK_ERRLOG("Failed to init attr IBV_QPS_RTR, errno %s (%d)\n", spdk_strerror(errno), errno);
 		return rc;
 	}
+
+	rdma_mlx5_dv_fill_roce_tos(&qp_attr, qp_attr_mask);
 
 	rc = ibv_modify_qp(mlx5_qp->common.qp, &qp_attr, qp_attr_mask);
 	if (rc) {
