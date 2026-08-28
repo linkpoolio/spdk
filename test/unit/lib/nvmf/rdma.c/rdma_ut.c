@@ -56,6 +56,42 @@ DEFINE_STUB(spdk_rdma_cm_id_get_numa_id, int32_t, (struct rdma_cm_id *cm_id), 0)
 DEFINE_STUB(spdk_rdma_utils_poll_cq, int, (struct ibv_cq *cq, int num_entries, struct ibv_wc *wc),
 	    0);
 
+#ifdef SPDK_CONFIG_RDMA_SET_TOS
+static int g_rdma_set_option_calls;
+static struct rdma_cm_id *g_rdma_set_option_id;
+static int g_rdma_set_option_level;
+static int g_rdma_set_option_optname;
+static uint8_t g_rdma_set_option_tos;
+static size_t g_rdma_set_option_optlen;
+static int g_rdma_set_option_rc;
+
+static void
+reset_rdma_set_option_mock(void)
+{
+	g_rdma_set_option_calls = 0;
+	g_rdma_set_option_id = NULL;
+	g_rdma_set_option_level = 0;
+	g_rdma_set_option_optname = 0;
+	g_rdma_set_option_tos = 0;
+	g_rdma_set_option_optlen = 0;
+	g_rdma_set_option_rc = 0;
+}
+
+int
+rdma_set_option(struct rdma_cm_id *id, int level, int optname, void *optval, size_t optlen)
+{
+	g_rdma_set_option_calls++;
+	g_rdma_set_option_id = id;
+	g_rdma_set_option_level = level;
+	g_rdma_set_option_optname = optname;
+	g_rdma_set_option_optlen = optlen;
+	if (optval != NULL && optlen >= sizeof(uint8_t)) {
+		g_rdma_set_option_tos = *(uint8_t *)optval;
+	}
+	return g_rdma_set_option_rc;
+}
+#endif
+
 /* ibv_reg_mr can be a macro, need to undefine it */
 #ifdef ibv_reg_mr
 #undef ibv_reg_mr
@@ -1872,6 +1908,116 @@ test_nvmf_rdma_resize_cq(void)
 	CU_ASSERT(rpoller.num_cqe > tnum_cqe);
 }
 
+static void
+test_nvmf_rdma_opts_tos(void)
+{
+	struct rdma_transport_opts opts = {};
+	struct spdk_json_val tos_obj[] = {
+		{"", 2, SPDK_JSON_VAL_OBJECT_BEGIN},
+		{"tos", 3, SPDK_JSON_VAL_NAME},
+		{"96", 2, SPDK_JSON_VAL_NUMBER},
+		{"", 0, SPDK_JSON_VAL_OBJECT_END},
+	};
+	struct spdk_json_val empty_obj[] = {
+		{"", 0, SPDK_JSON_VAL_OBJECT_BEGIN},
+		{"", 0, SPDK_JSON_VAL_OBJECT_END},
+	};
+	struct spdk_json_val zero_obj[] = {
+		{"", 2, SPDK_JSON_VAL_OBJECT_BEGIN},
+		{"tos", 3, SPDK_JSON_VAL_NAME},
+		{"0", 1, SPDK_JSON_VAL_NUMBER},
+		{"", 0, SPDK_JSON_VAL_OBJECT_END},
+	};
+
+	CU_ASSERT(spdk_json_decode_object_relaxed(tos_obj, rdma_transport_opts_decoder,
+			SPDK_COUNTOF(rdma_transport_opts_decoder), &opts) == 0);
+	CU_ASSERT(opts.tos == 96);
+
+	memset(&opts, 0, sizeof(opts));
+	CU_ASSERT(spdk_json_decode_object_relaxed(empty_obj, rdma_transport_opts_decoder,
+			SPDK_COUNTOF(rdma_transport_opts_decoder), &opts) == 0);
+	CU_ASSERT(opts.tos == 0);
+
+	opts.tos = 99;
+	CU_ASSERT(spdk_json_decode_object_relaxed(zero_obj, rdma_transport_opts_decoder,
+			SPDK_COUNTOF(rdma_transport_opts_decoder), &opts) == 0);
+	CU_ASSERT(opts.tos == 0);
+}
+
+static void
+test_nvmf_rdma_apply_tos(void)
+{
+	struct rdma_cm_id id = {};
+	int rc;
+
+#ifdef SPDK_CONFIG_RDMA_SET_TOS
+	reset_rdma_set_option_mock();
+#endif
+	rc = nvmf_rdma_apply_tos(&id, 0);
+	CU_ASSERT(rc == 0);
+#ifdef SPDK_CONFIG_RDMA_SET_TOS
+	CU_ASSERT(g_rdma_set_option_calls == 0);
+#endif
+
+	rc = nvmf_rdma_apply_tos(NULL, 96);
+	CU_ASSERT(rc == 0);
+#ifdef SPDK_CONFIG_RDMA_SET_TOS
+	CU_ASSERT(g_rdma_set_option_calls == 0);
+
+	reset_rdma_set_option_mock();
+	rc = nvmf_rdma_apply_tos(&id, 96);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_rdma_set_option_calls == 1);
+	CU_ASSERT(g_rdma_set_option_id == &id);
+	CU_ASSERT(g_rdma_set_option_level == RDMA_OPTION_ID);
+	CU_ASSERT(g_rdma_set_option_optname == RDMA_OPTION_ID_TOS);
+	CU_ASSERT(g_rdma_set_option_tos == 96);
+	CU_ASSERT(g_rdma_set_option_optlen == sizeof(uint8_t));
+
+	reset_rdma_set_option_mock();
+	g_rdma_set_option_rc = -1;
+	rc = nvmf_rdma_apply_tos(&id, 32);
+	CU_ASSERT(rc == -1);
+	CU_ASSERT(g_rdma_set_option_calls == 1);
+	CU_ASSERT(g_rdma_set_option_tos == 32);
+#else
+	rc = nvmf_rdma_apply_tos(&id, 96);
+	CU_ASSERT(rc == 0);
+#endif
+}
+
+static char g_tos_json_buf[512];
+static size_t g_tos_json_off;
+
+static int
+tos_json_write_cb(void *cb_ctx, const void *data, size_t size)
+{
+	if (g_tos_json_off + size >= sizeof(g_tos_json_buf)) {
+		return -1;
+	}
+	memcpy(g_tos_json_buf + g_tos_json_off, data, size);
+	g_tos_json_off += size;
+	return 0;
+}
+
+static void
+test_nvmf_rdma_dump_opts_tos(void)
+{
+	struct spdk_nvmf_rdma_transport rtransport = {};
+	struct spdk_json_write_ctx *w;
+
+	rtransport.rdma_opts.tos = 96;
+	memset(g_tos_json_buf, 0, sizeof(g_tos_json_buf));
+	g_tos_json_off = 0;
+	w = spdk_json_write_begin(tos_json_write_cb, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(w != NULL);
+	CU_ASSERT(spdk_json_write_object_begin(w) == 0);
+	nvmf_rdma_dump_opts(&rtransport.transport, w);
+	CU_ASSERT(spdk_json_write_object_end(w) == 0);
+	CU_ASSERT(spdk_json_write_end(w) == 0);
+	CU_ASSERT(strstr(g_tos_json_buf, "\"tos\":96") != NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1891,6 +2037,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_rdma_resources_create);
 	CU_ADD_TEST(suite, test_nvmf_rdma_qpair_compare);
 	CU_ADD_TEST(suite, test_nvmf_rdma_resize_cq);
+	CU_ADD_TEST(suite, test_nvmf_rdma_opts_tos);
+	CU_ADD_TEST(suite, test_nvmf_rdma_apply_tos);
+	CU_ADD_TEST(suite, test_nvmf_rdma_dump_opts_tos);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
