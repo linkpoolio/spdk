@@ -63,6 +63,7 @@ spdk_rdma_provider_qp_create(struct rdma_cm_id *cm_id,
 	}
 	spdk_rdma_qp->qp = cm_id->qp;
 	spdk_rdma_qp->cm_id = cm_id;
+	spdk_rdma_qp->tos = qp_attr->tos;
 	spdk_rdma_qp->domain = spdk_rdma_utils_get_memory_domain(qp_attr->pd);
 	if (!spdk_rdma_qp->domain) {
 		spdk_rdma_provider_qp_destroy(spdk_rdma_qp);

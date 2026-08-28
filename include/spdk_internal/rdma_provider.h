@@ -36,6 +36,8 @@ struct spdk_rdma_provider_qp_init_attr {
 	struct ibv_pd	       *pd;
 	struct spdk_rdma_provider_qp_stats *stats;
 	spdk_memory_domain_transfer_data_cb domain_transfer;
+	/* IPv4 TOS / IPv6 TCLASS. 0 = untagged (rdma-core default). */
+	uint8_t		tos;
 };
 
 struct spdk_rdma_provider_send_wr_list {
@@ -56,6 +58,7 @@ struct spdk_rdma_provider_qp {
 	struct spdk_rdma_provider_recv_wr_list recv_wrs;
 	struct spdk_rdma_provider_qp_stats *stats;
 	bool shared_stats;
+	uint8_t tos;
 };
 
 struct spdk_rdma_provider_srq_init_attr {
